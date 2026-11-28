@@ -1287,7 +1287,9 @@ long ee_fired = 0, ee_total = 0, ee_passes_run = 0;   // early-exit counters (ru
             return p ? std::fopen(p, "ab") : nullptr;
         }();
 
+        std::vector<int> visit_start;   // ds index where each visit begins, INK_SEGPROF
         auto run_visit = [&](int ip, int visit, int pass_idx, bool has_msgs) {
+            visit_start.push_back((int)ds.size());
             // Capture DSpark tap if visit in {5, 23, 41}
             if ((step.capture_taps && use_dspark) || getenv("INK_DFLASH_FD") || tapdump_fp) {
                 for (int ti = 0; ti < 3; ++ti) {
@@ -2610,8 +2612,11 @@ long ee_fired = 0, ee_total = 0, ee_passes_run = 0;   // early-exit counters (ru
         static const bool segprof = std::getenv("INK_SEGPROF") != nullptr;
         if (timeline && M >= 2 && M <= 32 && step.compute_logits) {
             // already executed via run_graph_seg above
-        } else if (segprof && step.M >= 1) {
-            // Segment at every barrier dispatch: host timestamp deltas approximate per-segment GPU completion times.
+        } else if (segprof && step.M >= 2) {
+            // Per-barrier segment completion timing in ONE command buffer via the shared-event
+            // handshake (run_graph_seg).  Gated to M>=2: M=1 decode cut into per-buffer pieces
+            // returns phantom GPU timestamps on this GPU family (30-50s per segment), so M=1
+            // per-visit attribution stays with INK_TIMELINE on verify steps + the traffic model.
             static std::vector<int> cuts;
             static std::vector<std::string> segname;
             static bool built = false;

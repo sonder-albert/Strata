@@ -19,7 +19,7 @@ def main():
         if name == 'kernel_main.py':
             continue
         blobs[name] = pack(f)
-    id2cid = pack('/Users/sonders/dageno-modelbench/hy4_id2cid.npy')
+    id2cid = pack('/Users/sonder/dageno-modelbench/hy4_id2cid.npy')
     main_src = open(os.path.join(HERE, 'payload', 'kernel_main.py')).read()
 
     header = '''"""Self-contained kaggle kernel: Inkling-2-Mini engram graft training.

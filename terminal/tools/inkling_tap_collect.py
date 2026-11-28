@@ -252,7 +252,7 @@ def to_windows(seqs: list[np.ndarray], prompt_lens: list[int], window: int = 77,
                stride: int = 37) -> dict[str, np.ndarray]:
     """Slice each sequence into overlapping [window, ...] windows.
     taps [N,W,4,D] fp32; tokens [N,W] int32; is_generated [N,W] bool; src [N,3]."""
-    taps_l, toks_l, gen_l, src_l = [], [], [], []
+    taps_l, toks_l, pos_l, gen_l, src_l = [], [], [], [], []
     for si, blk in enumerate(seqs):
         pos = blk[:, 0:4].view(np.int32)[:, 0]
         tokv = blk[:, 4:8].view(np.int32)[:, 0]
@@ -263,6 +263,7 @@ def to_windows(seqs: list[np.ndarray], prompt_lens: list[int], window: int = 77,
         while s + window <= n:
             taps_l.append(taps[s:s + window])
             toks_l.append(tokv[s:s + window])
+            pos_l.append(pos[s:s + window])
             g = pos[s:s + window] >= plen - 1  # rows written by decode steps
             gen_l.append(g)
             src_l.append([si, s, plen])
@@ -270,6 +271,7 @@ def to_windows(seqs: list[np.ndarray], prompt_lens: list[int], window: int = 77,
     return {
         "taps": np.stack(taps_l) if taps_l else np.zeros((0, window, 4, D), np.float32),
         "tokens": np.stack(toks_l) if toks_l else np.zeros((0, window), np.int32),
+        "pos": np.stack(pos_l) if pos_l else np.zeros((0, window), np.int32),
         "is_generated": np.stack(gen_l) if gen_l else np.zeros((0, window), bool),
         "src": np.asarray(src_l, np.int32),
     }
