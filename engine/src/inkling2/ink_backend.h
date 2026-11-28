@@ -136,6 +136,17 @@ public:
         return false;
     }
 
+    // Greedy-only extreme of the candidate rows: only the argmax id per wanted row comes back, the unembed is
+    // fused with argmax on the GPU and the full logits never exist anywhere (not even in device memory).
+    // out is resized to count_logits rows, in the order of the wanted rows. Exact: same reduction order the
+    // full-row host argmax uses (first max wins).
+    virtual bool supports_greedy_argmax() const noexcept { return false; }
+    virtual bool forward_batch_argmax(const StepBatch& batch, std::vector<int32_t>& out_ids, std::string& err) {
+        (void)batch; (void)out_ids;
+        err = "this backend does not return greedy argmax rows";
+        return false;
+    }
+
     // On-device DSpark Block-8 Recurrent Markov drafting for one slot.
     // Returns number of drafted tokens (0..max_draft, typically up to 7); returns 0 if unavailable/disabled.
     virtual int dspark_draft(

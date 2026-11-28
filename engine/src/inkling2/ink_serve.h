@@ -874,11 +874,26 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         }
 
         // 2. Fast-path: Single-stream DSpark Adaptive Beam Tree (greedy) / Block-8 Rejection Sampling (temperature >= 0) (#6633)!
-        if (use_dspark && n_active == 1 && reqs[sole_slot].prefill_pos >= reqs[sole_slot].prompt_len &&
-            reqs[sole_slot].generated + 2 <= reqs[sole_slot].max_new &&
-            reqs[sole_slot].cur_pos + 8 < eff_max_ctx &&
-            !(spec_adapt && (reqs[sole_slot].gov_plain_left > 0 || reqs[sole_slot].gov_calib_left > 0))) {
-            auto& rq = reqs[sole_slot];
+        static const bool spec_multi = std::getenv("INK_SPEC_MULTI") != nullptr;
+        auto spec_slot_ok = [&](int s) -> bool {
+            return reqs[s].active && reqs[s].prefill_pos >= reqs[s].prompt_len &&
+                   reqs[s].generated + 2 <= reqs[s].max_new &&
+                   reqs[s].cur_pos + 8 < eff_max_ctx;
+        };
+        int spec_target = sole_slot;
+        if (spec_multi && n_active > 1) {
+            // Round-robin across spec-eligible slots so concurrent streams each get
+            // speculative steps in turn; their verify passes batch naturally.
+            static int rr_cursor = 0;
+            spec_target = -1;
+            for (int k = 0; k < P; ++k) {
+                const int s = (rr_cursor + k) % P;
+                if (spec_slot_ok(s)) { spec_target = s; rr_cursor = (s + 1) % P; break; }
+            }
+        }
+        if ((use_dspark || (std::getenv("INK_DFLASH_FD") && reqs[sole_slot].s.greedy() && !reqs[sole_slot].s.penalties() && reqs[sole_slot].s.hold_budget==0)) && (n_active == 1 ? (spec_slot_ok(sole_slot)) : (spec_multi && spec_target >= 0)) &&
+            !(spec_adapt && (reqs[spec_target >= 0 ? spec_target : sole_slot].gov_plain_left > 0 || reqs[spec_target >= 0 ? spec_target : sole_slot].gov_calib_left > 0))) {
+            auto& rq = reqs[spec_target >= 0 ? spec_target : sole_slot];
             // 2a. Zero-D2H fused greedy Beam Tree speculative step (when greedy, no penalties, and headroom >= 12)
             if (spec_tree && rq.s.greedy() && !rq.s.penalties() && rq.cur_pos + 12 < eff_max_ctx) {
                 int32_t emitted[16]{};
@@ -929,30 +944,72 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             }
             int32_t draft_ids[8]{};
             std::string derr;
-            const int max_d = std::min(7, rq.max_new - rq.generated - 1);
+            static const int spec_nd_cap = [] { const char* e = std::getenv("INK_SPEC_ND"); return e ? atoi(e) : 7; }();
+            const int max_d = std::min(spec_nd_cap, rq.max_new - rq.generated - 1);
             const double gov_b0 = now_s();
             int nd = backend.dspark_draft(rq.slot, rq.next_tok, rq.cur_pos, max_d, draft_ids, derr);
             if (nd > 0) {
                 backend.snapshot_slot(rq.slot);
                 batch.clear();
-                batch.capture_taps = true;
+                static const bool no_taps = std::getenv("STRATA_INK_NO_VER_TAPS") != nullptr;
+                batch.capture_taps = !no_taps;
                 batch.push(rq.slot, rq.cur_pos, rq.next_tok, true);
                 for (int i = 0; i < nd; ++i) {
                     batch.push(rq.slot, rq.cur_pos + 1 + i, draft_ids[i], true);
                 }
-                logits_buf.resize(static_cast<size_t>(nd + 1) * V);
+                // Verify on candidate rows when possible (#6779): (nd+1) rows of 800KB full logits
+                // become (nd+1) x 1KB - the GPU keeps them, only the 128 best pairs come back.
+                // Only a penalty needs the whole row (it rewrites logits anywhere in it).
+                // greedy only for now: speculative rejection sampling for temp>0 needs the exact
+                // accept/reject marginal over the residual distribution; implement it on the cand row before enabling there.
+                // Greedy goes one step further than candidate rows: the fused unembed+argmax never
+                // materializes logits at all - one weight pass, 4 bytes back per row.
+                static const bool amax_off = std::getenv("STRATA_INK_NO_AMAX") != nullptr;
+                bool use_amax = !amax_off && backend.supports_greedy_argmax() && rq.s.greedy() && !rq.s.penalties();
+                bool use_cand = !use_amax && cand_ok && backend.supports_candidates() && rq.s.greedy() && !rq.s.penalties();
                 std::string ferr;
-                if (!backend.forward_batch(batch, logits_buf.data(), nullptr, ferr)) {
-                    proto("ERR fatal GPU error: %s", ferr.c_str());
-                    return 1;
+                CandRows cand;
+                std::vector<int32_t> amax_ids;
+                if (use_amax) {
+                    use_amax = backend.forward_batch_argmax(batch, amax_ids, ferr);
+                    if (!use_amax && !ferr.empty() && backend.last_failure_is_kv_growth()) {
+                        proto("ERR fatal GPU error: %s", ferr.c_str());
+                        return 1;
+                    }
+                    if (!use_amax) use_cand = cand_ok && backend.supports_candidates();
+                }
+                if (!use_amax && use_cand) {
+                    use_cand = backend.forward_batch_cand(batch, cand, ferr);
+                    if (!use_cand && cand.rows == 0 && !ferr.empty() && backend.last_failure_is_kv_growth()) {
+                        proto("ERR fatal GPU error: %s", ferr.c_str());
+                        return 1;
+                    }
+                }
+                if (!use_amax && !use_cand) {
+                    logits_buf.resize(static_cast<size_t>(nd + 1) * V);
+                    if (!backend.forward_batch(batch, logits_buf.data(), nullptr, ferr)) {
+                        proto("ERR fatal GPU error: %s", ferr.c_str());
+                        return 1;
+                    }
+                }
+                if (std::getenv("STRATA_INK_VDEBUG")) {
+                    static int vdb = 0;
+                    if (++vdb % 16 == 1) fprintf(stderr, "[vdebug] nd=%d use_amax=%d use_cand=%d greedy=%d pen=%d cand_ok=%d sup_amax=%d sup_cand=%d\n",
+                        nd, (int)use_amax, (int)use_cand, (int)rq.s.greedy(), (int)rq.s.penalties(), (int)cand_ok,
+                        (int)backend.supports_greedy_argmax(), (int)backend.supports_candidates());
+                }
+                int vstep_no = 0;
+                if (std::getenv("STRATA_INK_VDEBUG")) {
+                    static int vn = 0;
+                    vstep_no = ++vn;
                 }
                 rq.drafts_offered += nd;
                 int accepted = 0;
                 bool done = false;
                 const char* fin = nullptr;
                 for (int i = 0; i <= nd; ++i) {
-                    float* lg = logits_buf.data() + static_cast<size_t>(i) * V;
-                    if (!finite_logits(lg, V)) {
+                    float* lg = use_cand ? nullptr : logits_buf.data() + static_cast<size_t>(i) * V;
+                    if (!use_amax && (use_cand ? cand.finite[static_cast<size_t>(i)] == 0 : !finite_logits(lg, V))) {
                         // Never leave poisoned KV/ShortConv prefix cached across retries (#879)!
                         rq.cached_prefix.clear();
                         rq.prompt_ckpt_prefix.clear();
@@ -963,9 +1020,20 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                         break;
                     }
                     bool draft_ok = false;
-                    int32_t tok = (i < nd)
-                        ? verify_draft_logits(lg, V, rq.s, rq.hist, rq.rng, draft_ids[i], draft_ok)
-                        : sample_logits(lg, V, rq.s, rq.hist, rq.rng);
+                    int32_t tok;
+                    if (use_amax) {
+                        tok = amax_ids[static_cast<size_t>(i)];
+                        draft_ok = (i < nd) && (tok == draft_ids[i]);
+                    } else if (use_cand) {
+                        const float* cv = cand.val.data() + static_cast<size_t>(i) * InkBackend::kInkCandidates;
+                        const int32_t* ci = cand.idx.data() + static_cast<size_t>(i) * InkBackend::kInkCandidates;
+                        tok = sample_candidates(cv, ci, V, rq.s, rq.rng);
+                        draft_ok = (i < nd) && (tok == draft_ids[i]);
+                    } else {
+                        tok = (i < nd)
+                            ? verify_draft_logits(lg, V, rq.s, rq.hist, rq.rng, draft_ids[i], draft_ok)
+                            : sample_logits(lg, V, rq.s, rq.hist, rq.rng);
+                    }
                     rq.hist.push_back(tok);
                     rq.gen_ids.push_back(tok);
                     rq.cached_prefix.push_back(i == 0 ? rq.next_tok : draft_ids[i - 1]);
@@ -981,15 +1049,47 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                         ++accepted;
                         ++rq.drafts_accepted;
                     } else {
+                        if (std::getenv("STRATA_INK_VDEBUG")) {
+                            static int rej = 0;
+                            if (++rej <= 12) fprintf(stderr, "[vdebug REJ] i=%d nd=%d draft=%d verify_tok=%d\n", i, nd, draft_ids[i], tok);
+                        }
                         rq.next_tok = tok;
                         ++accepted;
                         break;
                     }
                 }
+                if (std::getenv("STRATA_INK_VDEBUG") && vstep_no && vstep_no <= 40) {
+                    fprintf(stderr, "[vdebug STEP] #%d nd=%d accepted=%d\n", vstep_no, nd, accepted);
+                }
                 if (!done) {
                     if (accepted <= nd) {
                         // Rolled back to anchor + accepted tokens
                         backend.rollback_slot(rq.slot, rq.cur_pos + accepted);
+                        // dsp_ctx repair (#rejfix): the verify batch captured tap features of the REJECTED
+                        // draft token at the position where the correct token now belongs (pos0 + accepted).
+                        // Entries before it came from accepted drafts (correct); the position beyond it is
+                        // never re-fed (its input is correct-but-not-fed). Drafts reading that poisoned
+                        // position degrade every later chain - repair it with one capture-taps step of the
+                        // correct token, then roll the trunk state back again. This is the only stale entry:
+                        // all later positions of the chain belong to tokens after the rollback point and are
+                        // overwritten before use.
+                        if (accepted >= 1 && accepted <= nd) {
+                            // the repair forward IS the bonus token's real feed step: correct token at the
+                            // correct position, capture_taps on. its logits row re-predicts the continuation;
+                            // greedy argmax of it is the true next token. state after it is the correct
+                            // continuation state - NO rollback needed (and none wanted: a ring hit would be wrong).
+                            StepBatch rb;
+                            rb.capture_taps = true;
+                            rb.push(rq.slot, rq.cur_pos + accepted, rq.next_tok, true);
+                            std::string rerr;
+                            std::vector<float> rlg((size_t)V);
+                            if (backend.forward_batch(rb, rlg.data(), nullptr, rerr)) {
+                                int32_t best = 0;
+                                for (int v = 1; v < V; ++v) if (rlg[v] > rlg[best]) best = v;
+                                rq.next_tok = best;
+                                ++accepted;      // the repair step also feeds the bonus token: position advances past it
+                            }
+                        }
                     }
                     rq.cur_pos += accepted;
                     if (spec_adapt) gov_step(rq, accepted, (now_s() - gov_b0) * 1000.0);
@@ -997,6 +1097,115 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                     finish_req(rq, fin);
                 }
                 continue;
+            }
+        }
+
+        // 2c. Multi-stream chain speculation: every decoding slot drafts independently,
+        // then ONE merged forward_batch verifies all chains. Trunk weight streaming is
+        // shared across slots - the core continuous-batching advantage, now with speculation.
+        static const bool spec_batch = std::getenv("INK_SPEC_BATCH") != nullptr;
+        if (spec_batch && use_dspark && n_active > 1) {
+            int n_pf = 0, n_dec = 0;
+            for (int s = 0; s < P; ++s) {
+                if (!reqs[s].active) continue;
+                if (reqs[s].prefill_pos < reqs[s].prompt_len) ++n_pf; else ++n_dec;
+            }
+            if (n_pf == 0 && n_dec == n_active) {
+                // draft chains per slot
+                int32_t draft_ids_all[64][8]{};
+                int nd_all[64] = {};
+                int n_spec = 0;
+                for (int s = 0; s < P; ++s) {
+                    auto& rq = reqs[s];
+                    if (!rq.active) continue;
+                    if (rq.cur_pos + 8 >= eff_max_ctx) continue;
+                    if (!rq.s.greedy() || rq.s.penalties()) continue;
+                    static const int spec_nd_env = [] { const char* e = std::getenv("INK_SPEC_ND"); return e ? atoi(e) : 4; }();
+                    const int max_d = std::min(spec_nd_env, rq.max_new - rq.generated - 1);
+                    if (max_d < 1) continue;
+                    std::string derr;
+                    int nd = backend.dspark_draft(rq.slot, rq.next_tok, rq.cur_pos, max_d, draft_ids_all[s], derr);
+                    if (nd > 0) { nd_all[s] = nd; ++n_spec; backend.snapshot_slot(rq.slot); }
+                }
+                if (n_spec > 0) {
+                    batch.clear();
+                    batch.capture_taps = true;
+                    int row_count = 0;
+                    for (int s = 0; s < P; ++s) {
+                        if (nd_all[s] <= 0) continue;
+                        auto& rq = reqs[s];
+                        batch.push(s, rq.cur_pos, rq.next_tok, true);
+                        ++row_count;
+                        for (int i = 0; i < nd_all[s]; ++i) {
+                            batch.push(s, rq.cur_pos + 1 + i, draft_ids_all[s][i], true);
+                            ++row_count;
+                        }
+                    }
+                    logits_buf.resize(static_cast<size_t>(row_count) * V);
+                    std::string ferr;
+                    const double spec_t0 = now_s();
+                    if (!backend.forward_batch(batch, logits_buf.data(), nullptr, ferr)) {
+                        proto("ERR fatal GPU error: %s", ferr.c_str());
+                        return 1;
+                    }
+                    const double spec_ms = (now_s() - spec_t0) * 1000.0;
+                    // verify per slot
+                    int row_off = 0;
+                    bool any_emitted = false;
+                    for (int s = 0; s < P; ++s) {
+                        if (nd_all[s] <= 0) continue;
+                        auto& rq = reqs[s];
+                        const int nd = nd_all[s];
+                        rq.drafts_offered += nd;
+                        int accepted = 0;
+                        bool done = false;
+                        const char* fin = nullptr;
+                        for (int i = 0; i <= nd; ++i) {
+                            float* lg = logits_buf.data() + static_cast<size_t>(row_off + i) * V;
+                            if (!finite_logits(lg, V)) {
+                                rq.cached_prefix.clear();
+                                rq.prompt_ckpt_prefix.clear();
+                                rq.shared_prefix.clear();
+                                backend.reset_slot(rq.slot);
+                                finish_req(rq, "nonfinite");
+                                done = true;
+                                break;
+                            }
+                            bool draft_ok = false;
+                            int32_t tok = (i < nd)
+                                ? verify_draft_logits(lg, V, rq.s, rq.hist, rq.rng, draft_ids_all[s][i], draft_ok)
+                                : sample_logits(lg, V, rq.s, rq.hist, rq.rng);
+                            rq.hist.push_back(tok);
+                            rq.gen_ids.push_back(tok);
+                            rq.cached_prefix.push_back(i == 0 ? rq.next_tok : draft_ids_all[s][i - 1]);
+                            ++rq.generated;
+                            any_emitted = true;
+                            if (rq.is_solo) proto("T %d", tok);
+                            else if (rq.is_ext_gen) proto("T %s %d", rq.req_id.c_str(), tok);
+                            else proto("BT %d %d", rq.slot, tok);
+                            if (is_stop_tok(tok)) { fin = "stop"; done = true; ++accepted; break; }
+                            if (rq.generated >= rq.max_new) { fin = "length"; done = true; ++accepted; break; }
+                            if (cfg.anti_loop && detect_repetition_loop(rq.gen_ids)) { fin = "stop"; done = true; ++accepted; break; }
+                            if (i < nd && draft_ok) {
+                                ++accepted;
+                                ++rq.drafts_accepted;
+                            } else {
+                                rq.next_tok = tok;
+                                ++accepted;
+                                break;
+                            }
+                        }
+                        row_off += nd + 1;
+                        if (!done) {
+                            if (accepted <= nd) backend.rollback_slot(rq.slot, rq.cur_pos + accepted);
+                            rq.cur_pos += accepted;
+                            if (spec_adapt) gov_step(rq, accepted, spec_ms);
+                        } else if (fin) {
+                            finish_req(rq, fin);
+                        }
+                    }
+                    if (any_emitted) continue;
+                }
             }
         }
 
