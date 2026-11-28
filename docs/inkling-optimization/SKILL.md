@@ -1979,3 +1979,26 @@ INK_PASSES engine override retained for future experiments (accepted upstream va
 - ✓ KV/SC slot-budget clamp(64 slots 不再 OOM)
 - ✗ 跨 slot 合并 verify 窗口(spec_batch)损坏:host logits verify 的分布错位未修
 - 遗留:M=2 near-tie argmax flip(slot2,1/6 概率)未复现于本轮 3-req 测试但文献记录存在
+
+## 2026-11-28 LoopSpec 可行性判定实验(M1 Max, SQ-10, --agree/--ee)
+
+新工具(commit b5843e1): `--agree N`(teacher-forced 重放 pass-3 贪婪流,per-pass argmax+top1prob 转储)、`--ee TAU`/INK_EE(pass 边界分段 forward,预 coda 置信度早退)、runner.pass_override 运行时覆盖、ink_argmax_prob kernel(argmax+softcap-logsumexp 概率一次归约)。
+
+### 关键数据
+- pass-k argmax == pass-3 argmax 同意率:code p1=79.7% p2=85.4%;prose p1=73.4% p2=82.3%
+- post-coda top1 prob 校准:≥0.95 → 100% 对(n=67 code + n=26 prose,零失误);SQ-10 未破坏置信度
+- pass-3 batched argmax vs M=1 贪婪:code 192/192 exact,prose 189/192,3 处翻转全在 prob<0.4 近并列 → host-verify 病灶=低置信 token 数值敏感,不是系统性内核 bug
+- 预 coda prob 分布平坦:τ=0.80 只退出 5.3%,τ=0.60 已 divergence → coda 是 sharpen 的来源,早退判据无法放在 coda 前
+
+### 结论
+1. 固定 3-pass 模型没有"少跑 pass"的免费提速:每个 token 都须付完它需要的 pass。LoopSpec 唯一可移植收益是跨 token pass 流水(scheduler 级重构),浅 pass 同意率 82-85% 已经偏低,流水挽回也受限 → 列为远期。
+2. pass-2 argmax 当 draft 的同意率(82-85%)不优于现有 dspark(~85-90%),且每 draft 行都要花 verify 行 → 不值得替换。
+3. **主线索不变:修 host-verify**(block/spec_batch 接受率 3.9%)。新病灶特征:差错集中在 prob<0.4 的近并列 token,先在低置信位置做数值差分(误差条件数),最容易抓到真凶。
+4. dspark 蒸馏(DFlash 配方)仍是提接受率的正路,属训练远期项。
+
+### 复现
+```
+INK_AGREE_DUMP=/tmp/ag ./strata-inkling-metal --native sq10.strata --parallel 1 --draft off \
+  --agree 192 --ids "<chat_tokens.py ids>"
+./strata-inkling-metal --native sq10.strata --draft off --gen 96 --ee 0.80 --ids "..."
+```
