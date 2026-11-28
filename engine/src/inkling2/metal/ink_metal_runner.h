@@ -1510,8 +1510,8 @@ long ee_fired = 0, ee_total = 0, ee_passes_run = 0;   // early-exit counters (ru
                 }();
                 // Fused single-dispatch path for M==1 decode: replaces 6-8 small back-to-back
                 // GEMV dispatches with one wide kernel so warps from different projections
-                // interleave (no drain/refill bubbles between them). Requires Q8_ROW trunk
-                // projections, F32 sinks/sconv, and all weights in the shared sec1 buffer.
+                // interleave (no drain/refill bubbles between them). Requires Q8_ROW / SF4 / F32
+                // trunk projections and all weights in the shared sec1 buffer.
                 const char* ap_names[8] = {".attn.wq_du.weight", ".attn.wk_dv.weight", ".attn.wv_dv.weight",
                                            ".attn.wr_du.weight", ".attn.attn_sink_proj.weight", ".attn.gate_attn.weight",
                                            ".attn.k_sconv.weight_proj", ".attn.v_sconv.weight_proj"};
@@ -1520,11 +1520,8 @@ long ee_fired = 0, ee_total = 0, ee_passes_run = 0;   // early-exit counters (ru
                 const mtl::Arg xins[8] = {in_q, in_k, in_v, in_q, in_q, in_q, in_k, in_v};
                 for (int i = 0; can_fuse && i < nproj; ++i) {
                     const auto& ti = mod->man.get(p + ap_names[i]);
-                    const bool q8 = ti.fmt == FMT_Q8ROW;
-                    const bool f32 = ti.fmt == FMT_F32;
-                    if (!(q8 || f32) || (int)ti.cols() != D || (ti.rows() % 4) != 0) can_fuse = false;
-                    if (!q8 && !f32) can_fuse = false;
-                    // wq/wk/wv/wr/gate must be Q8; sinks/sconv F32-only in practice but accept either
+                    const bool okfmt = (ti.fmt == FMT_Q8ROW || ti.fmt == FMT_F32 || ti.fmt == FMT_SF4);
+                    if (!okfmt || (int)ti.cols() != D || (ti.rows() % 4) != 0) can_fuse = false;
                 }
                 if (can_fuse) {
                     InkAttnProjFusedParams fp{};
@@ -1537,7 +1534,7 @@ long ee_fired = 0, ee_total = 0, ee_passes_run = 0;   // early-exit counters (ru
                         const mtl::Arg wa = mod->tw(nm);
                         fp.w_off[i] = (uint64_t)wa.off;
                         fp.n_rows[i] = (uint32_t)ti.rows();
-                        fp.is_f32[i] = (ti.fmt == FMT_F32) ? 1u : 0u;
+                        fp.is_f32[i] = (ti.fmt == FMT_F32) ? 1u : (ti.fmt == FMT_SF4) ? 2u : 0u;
                         fp.x_off4[i] = (uint32_t)(xins[i].off / 4);
                         fp.out_idx[i] = (uint32_t)i;
                         fp.out_off[i] = 0;

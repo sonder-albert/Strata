@@ -1030,7 +1030,7 @@ kernel void ink_argmax_part_reduce_m(
 struct InkAttnProjFusedParams {
     ulong w_off[8];      // byte offset of each projection's weight tensor in W (sec1 buffer)
     uint n_rows[8];      // rows per projection (0 = projection absent)
-    uint is_f32[8];      // 1 = F32 layout (no scale table), 0 = Q8_ROW
+    uint is_f32[8];      // weight layout code: 0 = Q8_ROW, 1 = F32, 2 = SF4 (nvfp4)
     uint x_off4[8];      // x input byte offset within X, in FLOAT units (off_bytes/4)
     uint out_idx[8];     // output buffer index (see binding order below)
     ulong out_off[8];    // byte offset within that output buffer
@@ -1075,6 +1075,81 @@ kernel void ink_attnproj_fused_mv1(
     (void)x_stride;
 
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    if (P.is_f32[pi] == 2u) {
+        // SF4 (NVFP4) layout: [16B hdr][N x K/2 E2M1 codes][N x K/16 E4M3 scales].
+        // Same math as ink_linear_sf4_mv1: one 16-weight block per lane per iter.
+        device const float* hdr = (device const float*)wbase;
+        const float outer = hdr[0] / hdr[1];
+        const int Kc = K >> 1, Ks = K >> 4;
+        device const uchar* p_base = wbase + 16;
+        device const uchar* s_base = p_base + (size_t)Np * Kc;
+        device const uint2* q0p = (device const uint2*)(p_base + (size_t)row0 * Kc);
+        device const uint2* q1p = (device const uint2*)(p_base + (size_t)(row0 + (h1 ? 1 : 0)) * Kc);
+        device const uint2* q2p = (device const uint2*)(p_base + (size_t)(row0 + (h2 ? 2 : 0)) * Kc);
+        device const uint2* q3p = (device const uint2*)(p_base + (size_t)(row0 + (h3 ? 3 : 0)) * Kc);
+        device const uchar* s0p = s_base + (size_t)row0 * Ks;
+        device const uchar* s1p = s_base + (size_t)(row0 + (h1 ? 1 : 0)) * Ks;
+        device const uchar* s2p = s_base + (size_t)(row0 + (h2 ? 2 : 0)) * Ks;
+        device const uchar* s3p = s_base + (size_t)(row0 + (h3 ? 3 : 0)) * Ks;
+        for (int b = int(lane); b < Ks; b += 32) {
+            const float4 x0 = xp[b * 4], x1 = xp[b * 4 + 1], x2 = xp[b * 4 + 2], x3 = xp[b * 4 + 3];
+            {
+                const uint2 bg = q0p[b];
+                const float4 wg0 = float4(kE2M1[bg.x & 15u], kE2M1[(bg.x >> 4) & 15u], kE2M1[(bg.x >> 8) & 15u], kE2M1[(bg.x >> 12) & 15u]);
+                const float4 wg1 = float4(kE2M1[(bg.x >> 16) & 15u], kE2M1[(bg.x >> 20) & 15u], kE2M1[(bg.x >> 24) & 15u], kE2M1[bg.x >> 28]);
+                const float4 wg2 = float4(kE2M1[bg.y & 15u], kE2M1[(bg.y >> 4) & 15u], kE2M1[(bg.y >> 8) & 15u], kE2M1[(bg.y >> 12) & 15u]);
+                const float4 wg3 = float4(kE2M1[(bg.y >> 16) & 15u], kE2M1[(bg.y >> 20) & 15u], kE2M1[(bg.y >> 24) & 15u], kE2M1[bg.y >> 28]);
+                a0 = fma(e4m3_to_f32(s0p[b]) * outer, dot(wg0, x0) + dot(wg1, x1) + dot(wg2, x2) + dot(wg3, x3), a0);
+            }
+            if (h1) {
+                const uint2 bg = q1p[b];
+                const float4 wg0 = float4(kE2M1[bg.x & 15u], kE2M1[(bg.x >> 4) & 15u], kE2M1[(bg.x >> 8) & 15u], kE2M1[(bg.x >> 12) & 15u]);
+                const float4 wg1 = float4(kE2M1[(bg.x >> 16) & 15u], kE2M1[(bg.x >> 20) & 15u], kE2M1[(bg.x >> 24) & 15u], kE2M1[bg.x >> 28]);
+                const float4 wg2 = float4(kE2M1[bg.y & 15u], kE2M1[(bg.y >> 4) & 15u], kE2M1[(bg.y >> 8) & 15u], kE2M1[(bg.y >> 12) & 15u]);
+                const float4 wg3 = float4(kE2M1[(bg.y >> 16) & 15u], kE2M1[(bg.y >> 20) & 15u], kE2M1[(bg.y >> 24) & 15u], kE2M1[bg.y >> 28]);
+                a1 = fma(e4m3_to_f32(s1p[b]) * outer, dot(wg0, x0) + dot(wg1, x1) + dot(wg2, x2) + dot(wg3, x3), a1);
+            }
+            if (h2) {
+                const uint2 bg = q2p[b];
+                const float4 wg0 = float4(kE2M1[bg.x & 15u], kE2M1[(bg.x >> 4) & 15u], kE2M1[(bg.x >> 8) & 15u], kE2M1[(bg.x >> 12) & 15u]);
+                const float4 wg1 = float4(kE2M1[(bg.x >> 16) & 15u], kE2M1[(bg.x >> 20) & 15u], kE2M1[(bg.x >> 24) & 15u], kE2M1[bg.x >> 28]);
+                const float4 wg2 = float4(kE2M1[bg.y & 15u], kE2M1[(bg.y >> 4) & 15u], kE2M1[(bg.y >> 8) & 15u], kE2M1[(bg.y >> 12) & 15u]);
+                const float4 wg3 = float4(kE2M1[(bg.y >> 16) & 15u], kE2M1[(bg.y >> 20) & 15u], kE2M1[(bg.y >> 24) & 15u], kE2M1[bg.y >> 28]);
+                a2 = fma(e4m3_to_f32(s2p[b]) * outer, dot(wg0, x0) + dot(wg1, x1) + dot(wg2, x2) + dot(wg3, x3), a2);
+            }
+            if (h3) {
+                const uint2 bg = q3p[b];
+                const float4 wg0 = float4(kE2M1[bg.x & 15u], kE2M1[(bg.x >> 4) & 15u], kE2M1[(bg.x >> 8) & 15u], kE2M1[(bg.x >> 12) & 15u]);
+                const float4 wg1 = float4(kE2M1[(bg.x >> 16) & 15u], kE2M1[(bg.x >> 20) & 15u], kE2M1[(bg.x >> 24) & 15u], kE2M1[bg.x >> 28]);
+                const float4 wg2 = float4(kE2M1[bg.y & 15u], kE2M1[(bg.y >> 4) & 15u], kE2M1[(bg.y >> 8) & 15u], kE2M1[(bg.y >> 12) & 15u]);
+                const float4 wg3 = float4(kE2M1[(bg.y >> 16) & 15u], kE2M1[(bg.y >> 20) & 15u], kE2M1[(bg.y >> 24) & 15u], kE2M1[bg.y >> 28]);
+                a3 = fma(e4m3_to_f32(s3p[b]) * outer, dot(wg0, x0) + dot(wg1, x1) + dot(wg2, x2) + dot(wg3, x3), a3);
+            }
+        }
+        const float v0s = simd_sum(a0);
+        const float v1s = simd_sum(a1);
+        const float v2s = simd_sum(a2);
+        const float v3s = simd_sum(a3);
+        device float* youtq = Yq;
+        switch (P.out_idx[pi]) {
+            case 0: youtq = Yq; break;
+            case 1: youtq = Yk; break;
+            case 2: youtq = Yv; break;
+            case 3: youtq = Yr; break;
+            case 4: youtq = Ysinks; break;
+            case 5: youtq = Ygate; break;
+            case 6: youtq = Yksc; break;
+            default: youtq = Yvsc; break;
+        }
+        youtq = (device float*)((device uchar*)youtq + P.out_off[pi]);
+        if (lane == 0) {
+            youtq[row0] = v0s;
+            if (h1) youtq[row0 + 1] = v1s;
+            if (h2) youtq[row0 + 2] = v2s;
+            if (h3) youtq[row0 + 3] = v3s;
+        }
+        return;
+    }
     if (P.is_f32[pi]) {
         // F32 layout: rows contiguous, row stride K floats.
         // Bit-exact replication of ink_linear_f32's M==1 accumulation order:
