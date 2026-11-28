@@ -1951,3 +1951,31 @@ INK_PASSES engine override retained for future experiments (accepted upstream va
 6. LoopCD:已集成(INK_LCD_W),fixed-3-pass 下中性保持关闭;后续跟社区 logits-adaptive+fused dual-unembed
 7. DSA:Inkling 已有 IndexShare top-2048 indexer → 本质是 qsa kernel 优化,4K ctx 下收益小
 8. GLM-5.4 借鉴:gated progressive updates≈attention residual 已有;MLA/CED/MoR 需重训,远期
+
+## 2026-11-28 M1 Max serve 实录:CB server 上线 + INK_SPEC_MULTI 转正
+
+### 部署(M1 Max,serve/ HTTP 栈)
+- 二进制:`engine/build/inkling-mac/src/inkling2/strata-inkling`(ninja,CMake 金属后端;CMakeLists 已有 metal 子目录)
+- tokenizer:HF `thinkingmachines/Inkling-2-Mini/resolve/main/tokenizer.json`(huggingface 直连超时,hf-mirror 可用)→ `terminal/tools/inkling_tokenizer.py --hf-json` 生成 `~/dageno-modelbench/tok_inkling/`
+- 服务:`terminal/serve/server.py` + cfg `~/dageno-modelbench/serve-out/cfg.json`(arch=inkling2_loop,--serve --native sq10.strata --parallel 8 --draft auto --max-context 8192)
+- python:jinja2 只有 /opt/anaconda3/bin/python3 有
+- **血泪**:cfg args 里别加第二个 `--serve`(serve_chat.py 会重复添加 → 引擎起两个,违反单权重实例规则)
+- 后台 nohup 会被会话管理器杀:服务必须在常驻 exec 会话前台跑(会话 71235/61982)
+
+### 并发性能与正确性(greedy temperature=0,reasoning_effort=none)
+| 配置 | 单请求 | 3并发/req | 4并发/req | 正确性 |
+|---|---|---|---|---|
+| 默认(spec_multi off) | 28-35 | 14.3 | - | - |
+| INK_SPEC_MULTI=1 | ~26 | 25.0 | 26.4/9.6 | 逐字节=solo ✓(同prompt+混合prompt) |
+| INK_SPEC_BATCH=1 | - | 4.4 | 4.3 | ✗ DIFFERS,接受率5%,仍然损坏 |
+
+- `spec_multi` 已改为默认 ON(INK_SPEC_MULTI=0 关),提交 49897b6
+- `spec_batch`(合并链 verify 2c)继续损坏:i=0 拒绝率~95%,输出与 solo 发散——root cause 同 block verify 未解
+- `draft_n_accepted` 在 BGEN 并发协议下计数不完整(BT 行不携带),HTTP timings 的 acc 数字在并发不可信
+
+### 连续批处理现状审计(ink_serve.h)
+- ✓ slot 1..64 BGEN 并发,交错 chunked prefill(token_budget 均分,prevents head-of-line)
+- ✓ spec_multi 轮转 GPU tree spec(修复并默认开)
+- ✓ KV/SC slot-budget clamp(64 slots 不再 OOM)
+- ✗ 跨 slot 合并 verify 窗口(spec_batch)损坏:host logits verify 的分布错位未修
+- 遗留:M=2 near-tie argmax flip(slot2,1/6 概率)未复现于本轮 3-req 测试但文献记录存在
