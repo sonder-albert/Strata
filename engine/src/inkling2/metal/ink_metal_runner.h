@@ -114,6 +114,7 @@ struct InkMetalRunner {
 
     // Metal 4 MPP Neural Accelerator pipelines (active when lib_mpp >= 0)
     mtl::Pipeline p_mpp_f32_to_f16, p_mpp_bf16_to_f16, p_mpp_q8_to_f16, p_mpp_sk_to_f16;
+    mtl::Pipeline p_mpp_sf4_to_f16;
     mtl::Pipeline p_mpp_mm_16_64, p_mpp_mm_32_64, p_mpp_mm_64_64, p_mpp_mm_64_128, p_mpp_mm_128_64;
     mtl::Pipeline p_mpp_split_qrsg, p_mpp_split_kv, p_mpp_ctrl_fuse_gf;
     mtl::Pipeline p_mpp_moe_plan, p_mpp_moe_gather;
@@ -128,6 +129,7 @@ struct InkMetalRunner {
     mtl::Pipeline p_lin_q8_mv1_wide;
     mtl::Pipeline p_lin_f32, p_lin_f32_mm, p_lin_f32_exact_mm;
     mtl::Pipeline p_lin_sk[9], p_lin_sk5_mm8, p_lin_sk6_mm8, p_unemb_topk_sk6_mm8, p_unemb_topk_merge;
+    mtl::Pipeline p_lin_sf4_mv1, p_lin_sf4_mv;
     mtl::Pipeline p_unemb_argmax_q8, p_unemb_argmax_bf16, p_unemb_argmax_sk6, p_argmax_part;
     mtl::Pipeline p_topk_pass1, p_topk_merge;
     mtl::Buffer bd_tk_p1, bd_tk_p2, bd_tk_out, bd_tk_fin;   // top-128 candidate scratch (#6779 metal port)
@@ -294,6 +296,8 @@ long ee_fired = 0, ee_total = 0, ee_passes_run = 0;   // early-exit counters (ru
         }
         p_lin_sk5_mm8   = cx->pipeline(lib_codecs, "ink_linear_sk5_mm8");
         p_lin_sk6_mm8   = cx->pipeline(lib_codecs, "ink_linear_sk6_mm8");
+        p_lin_sf4_mv1   = cx->pipeline(lib_codecs, "ink_linear_sf4_mv1");
+        p_lin_sf4_mv    = cx->pipeline(lib_codecs, "ink_linear_sf4_mv");
         p_unemb_topk_sk6_mm8 = cx->pipeline(lib_codecs, "ink_unembed_topk_sk6_mm8");
         p_unemb_topk_merge   = cx->pipeline(lib_codecs, "ink_unembed_topk_merge");
         p_moe_plan      = cx->pipeline(lib_codecs, "ink_moe_plan");
@@ -718,6 +722,7 @@ long ee_fired = 0, ee_total = 0, ee_passes_run = 0;   // early-exit counters (ru
             p_mpp_bf16_to_f16   = cx->pipeline(lib_mpp, "ink_mpp_bf16_to_f16");
             p_mpp_q8_to_f16     = cx->pipeline(lib_mpp, "ink_mpp_q8row_to_f16");
             p_mpp_sk_to_f16     = cx->pipeline(lib_mpp, "ink_mpp_sk_to_f16");
+            p_mpp_sf4_to_f16    = cx->pipeline(lib_mpp, "ink_mpp_sf4_to_f16");
             p_mpp_mm_16_64      = cx->pipeline(lib_mpp, "ink_mpp_mm_f16_16_64_4");
             p_mpp_mm_32_64      = cx->pipeline(lib_mpp, "ink_mpp_mm_f16_32_64_4");
             p_mpp_mm_64_64      = cx->pipeline(lib_mpp, "ink_mpp_mm_f16_64_64_4");
@@ -778,6 +783,9 @@ long ee_fired = 0, ee_total = 0, ee_passes_run = 0;   // early-exit counters (ru
                         d.args = {src_w, mtl::Arg::B(dst_b, byte_off), mtl::Arg::V(tot)};
                     } else if (ti.fmt == FMT_Q8ROW) {
                         d.p = &p_mpp_q8_to_f16; d.grid[0] = (uint32_t)((K + 255) / 256); d.grid[1] = (uint32_t)N; d.tg[0] = 256;
+                        d.args = {src_w, mtl::Arg::B(dst_b, byte_off), mtl::Arg::V(N), mtl::Arg::V(K)};
+                    } else if (ti.fmt == FMT_SF4) {
+                        d.p = &p_mpp_sf4_to_f16; d.grid[0] = (uint32_t)((K / 16 + 255) / 256); d.grid[1] = (uint32_t)N; d.tg[0] = 256;
                         d.args = {src_w, mtl::Arg::B(dst_b, byte_off), mtl::Arg::V(N), mtl::Arg::V(K)};
                     } else if (ti.fmt >= FMT_S2 && ti.fmt <= FMT_S8) {
                         int fmt_i = (int)ti.fmt;
@@ -1011,6 +1019,21 @@ long ee_fired = 0, ee_total = 0, ee_passes_run = 0;   // early-exit counters (ru
                 d.p = &p_lin_sk[ti.fmt];
                 d.grid[0] = (uint32_t)((N + 15) / 16);
                 d.tg[0] = 256;
+            }
+        } else if (ti.fmt == FMT_SF4) {
+            // NVFP4 dense linear: E2M1 codes + E4M3 block-16 scales. Register GEMV,
+            // one 16-weight block per lane iter (8B codes + 1B scale per row).
+            if (M == 1 && (K & 15) == 0) {
+                d.p = &p_lin_sf4_mv1;
+                d.grid[0] = (uint32_t)((N + 31) / 32);
+                d.tg[0] = 256;
+            } else if ((K & 15) == 0) {
+                d.p = &p_lin_sf4_mv;
+                d.grid[0] = (uint32_t)((N + 15) / 16);
+                d.tg[0] = 256;
+            } else {
+                fprintf(stderr, "[ink_metal] SF4 linear requires K %% 16 == 0 for %s (K=%d)\n", ti.name.c_str(), K);
+                exit(2);
             }
         } else {
             fprintf(stderr, "[ink_metal] unsupported linear fmt %d for %s\n", ti.fmt, ti.name.c_str());

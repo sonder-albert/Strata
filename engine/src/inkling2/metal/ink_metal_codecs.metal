@@ -1737,6 +1737,176 @@ kernel void ink_linear_sk5_mm8(
     }
 }
 
+// --- SF4 (NVFP4: E2M1 codes + F8_E4M3 scale/16w + F32 outer) dense linear GEMVs ---
+// Dense tensor body layout (matches sk_codecs.hpp dot_sf4_f32_row and the MoE expert layout):
+//   [4x F32 header: amax, denom, 0, 0] outer = hdr[0] / hdr[1]
+//   [N rows x K/2 bytes packed E2M1 nibbles (low = even col, high = odd col)]
+//   [N rows x K/16 bytes F8_E4M3FN block scales (1 per 16 weights)]
+// Requires K % 16 == 0. Per-lane unit = one 16-weight block: 8B codes (uint2) + 1B scale.
+
+// M=1: 32 rows per threadgroup (4 rows per simdgroup), one block per lane per iter.
+kernel void ink_linear_sf4_mv1(
+    device const uchar* W [[buffer(0)]],
+    device const float* X [[buffer(1)]],
+    device float* Y       [[buffer(2)]],
+    constant int& N       [[buffer(3)]],
+    constant int& K       [[buffer(4)]],
+    constant int& M       [[buffer(5)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    (void)M;
+    const uint sg = tid >> 5, lane = tid & 31;
+    const int row0 = int(tg) * 32 + int(sg) * 4;
+    if (row0 >= N) return;
+    const bool h1 = (row0 + 1) < N, h2 = (row0 + 2) < N, h3 = (row0 + 3) < N;
+    device const float* hdr = (device const float*)W;
+    const float outer = hdr[0] / hdr[1];
+    const int Kc = K >> 1, Ks = K >> 4;
+    device const uchar* p_base = W + 16;
+    device const uchar* s_base = p_base + (size_t)N * Kc;
+    device const uint2* q0p = (device const uint2*)(p_base + (size_t)row0 * Kc);
+    device const uint2* q1p = (device const uint2*)(p_base + (size_t)(row0 + (h1 ? 1 : 0)) * Kc);
+    device const uint2* q2p = (device const uint2*)(p_base + (size_t)(row0 + (h2 ? 2 : 0)) * Kc);
+    device const uint2* q3p = (device const uint2*)(p_base + (size_t)(row0 + (h3 ? 3 : 0)) * Kc);
+    device const uchar* s0p = s_base + (size_t)row0 * Ks;
+    device const uchar* s1p = s_base + (size_t)(row0 + (h1 ? 1 : 0)) * Ks;
+    device const uchar* s2p = s_base + (size_t)(row0 + (h2 ? 2 : 0)) * Ks;
+    device const uchar* s3p = s_base + (size_t)(row0 + (h3 ? 3 : 0)) * Ks;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int b = int(lane); b < Ks; b += 32) {
+        device const float4* xp = (device const float4*)(X + b * 16);
+        const float4 x0 = xp[0], x1 = xp[1], x2 = xp[2], x3 = xp[3];
+        {
+            const uint2 bg = q0p[b];
+            const float4 wg0 = float4(kE2M1[bg.x & 15u], kE2M1[(bg.x >> 4) & 15u], kE2M1[(bg.x >> 8) & 15u], kE2M1[(bg.x >> 12) & 15u]);
+            const float4 wg1 = float4(kE2M1[(bg.x >> 16) & 15u], kE2M1[(bg.x >> 20) & 15u], kE2M1[(bg.x >> 24) & 15u], kE2M1[bg.x >> 28]);
+            const float4 wg2 = float4(kE2M1[bg.y & 15u], kE2M1[(bg.y >> 4) & 15u], kE2M1[(bg.y >> 8) & 15u], kE2M1[(bg.y >> 12) & 15u]);
+            const float4 wg3 = float4(kE2M1[(bg.y >> 16) & 15u], kE2M1[(bg.y >> 20) & 15u], kE2M1[(bg.y >> 24) & 15u], kE2M1[bg.y >> 28]);
+            a0 = fma(e4m3_to_f32(s0p[b]) * outer, dot(wg0, x0) + dot(wg1, x1) + dot(wg2, x2) + dot(wg3, x3), a0);
+        }
+        if (h1) {
+            const uint2 bg = q1p[b];
+            const float4 wg0 = float4(kE2M1[bg.x & 15u], kE2M1[(bg.x >> 4) & 15u], kE2M1[(bg.x >> 8) & 15u], kE2M1[(bg.x >> 12) & 15u]);
+            const float4 wg1 = float4(kE2M1[(bg.x >> 16) & 15u], kE2M1[(bg.x >> 20) & 15u], kE2M1[(bg.x >> 24) & 15u], kE2M1[bg.x >> 28]);
+            const float4 wg2 = float4(kE2M1[bg.y & 15u], kE2M1[(bg.y >> 4) & 15u], kE2M1[(bg.y >> 8) & 15u], kE2M1[(bg.y >> 12) & 15u]);
+            const float4 wg3 = float4(kE2M1[(bg.y >> 16) & 15u], kE2M1[(bg.y >> 20) & 15u], kE2M1[(bg.y >> 24) & 15u], kE2M1[bg.y >> 28]);
+            a1 = fma(e4m3_to_f32(s1p[b]) * outer, dot(wg0, x0) + dot(wg1, x1) + dot(wg2, x2) + dot(wg3, x3), a1);
+        }
+        if (h2) {
+            const uint2 bg = q2p[b];
+            const float4 wg0 = float4(kE2M1[bg.x & 15u], kE2M1[(bg.x >> 4) & 15u], kE2M1[(bg.x >> 8) & 15u], kE2M1[(bg.x >> 12) & 15u]);
+            const float4 wg1 = float4(kE2M1[(bg.x >> 16) & 15u], kE2M1[(bg.x >> 20) & 15u], kE2M1[(bg.x >> 24) & 15u], kE2M1[bg.x >> 28]);
+            const float4 wg2 = float4(kE2M1[bg.y & 15u], kE2M1[(bg.y >> 4) & 15u], kE2M1[(bg.y >> 8) & 15u], kE2M1[(bg.y >> 12) & 15u]);
+            const float4 wg3 = float4(kE2M1[(bg.y >> 16) & 15u], kE2M1[(bg.y >> 20) & 15u], kE2M1[(bg.y >> 24) & 15u], kE2M1[bg.y >> 28]);
+            a2 = fma(e4m3_to_f32(s2p[b]) * outer, dot(wg0, x0) + dot(wg1, x1) + dot(wg2, x2) + dot(wg3, x3), a2);
+        }
+        if (h3) {
+            const uint2 bg = q3p[b];
+            const float4 wg0 = float4(kE2M1[bg.x & 15u], kE2M1[(bg.x >> 4) & 15u], kE2M1[(bg.x >> 8) & 15u], kE2M1[(bg.x >> 12) & 15u]);
+            const float4 wg1 = float4(kE2M1[(bg.x >> 16) & 15u], kE2M1[(bg.x >> 20) & 15u], kE2M1[(bg.x >> 24) & 15u], kE2M1[bg.x >> 28]);
+            const float4 wg2 = float4(kE2M1[bg.y & 15u], kE2M1[(bg.y >> 4) & 15u], kE2M1[(bg.y >> 8) & 15u], kE2M1[(bg.y >> 12) & 15u]);
+            const float4 wg3 = float4(kE2M1[(bg.y >> 16) & 15u], kE2M1[(bg.y >> 20) & 15u], kE2M1[(bg.y >> 24) & 15u], kE2M1[bg.y >> 28]);
+            a3 = fma(e4m3_to_f32(s3p[b]) * outer, dot(wg0, x0) + dot(wg1, x1) + dot(wg2, x2) + dot(wg3, x3), a3);
+        }
+    }
+    const float v0 = simd_sum(a0);
+    const float v1 = simd_sum(a1);
+    const float v2 = simd_sum(a2);
+    const float v3 = simd_sum(a3);
+    if (lane == 0) {
+        Y[row0] = v0;
+        if (h1) Y[row0 + 1] = v1;
+        if (h2) Y[row0 + 2] = v2;
+        if (h3) Y[row0 + 3] = v3;
+    }
+}
+
+// M>=2 (register GEMV, M<=8 fast path + M>8 chunks of 4): 16 rows/TG (2 rows per simdgroup).
+// Decode helper: one 16-weight block -> 4 float4s.
+static inline void sf4_block16(uint2 bg, thread float4& w0, thread float4& w1, thread float4& w2, thread float4& w3) {
+    w0 = float4(kE2M1[bg.x & 15u], kE2M1[(bg.x >> 4) & 15u], kE2M1[(bg.x >> 8) & 15u], kE2M1[(bg.x >> 12) & 15u]);
+    w1 = float4(kE2M1[(bg.x >> 16) & 15u], kE2M1[(bg.x >> 20) & 15u], kE2M1[(bg.x >> 24) & 15u], kE2M1[bg.x >> 28]);
+    w2 = float4(kE2M1[bg.y & 15u], kE2M1[(bg.y >> 4) & 15u], kE2M1[(bg.y >> 8) & 15u], kE2M1[(bg.y >> 12) & 15u]);
+    w3 = float4(kE2M1[(bg.y >> 16) & 15u], kE2M1[(bg.y >> 20) & 15u], kE2M1[(bg.y >> 24) & 15u], kE2M1[bg.y >> 28]);
+}
+
+kernel void ink_linear_sf4_mv(
+    device const uchar* W [[buffer(0)]],
+    device const float* X [[buffer(1)]],
+    device float* Y       [[buffer(2)]],
+    constant int& N       [[buffer(3)]],
+    constant int& K       [[buffer(4)]],
+    constant int& M       [[buffer(5)]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    const uint sg = tid >> 5, lane = tid & 31;
+    const int row0 = int(tg) * 16 + int(sg) * 2;
+    if (row0 >= N) return;
+    const bool has1 = (row0 + 1) < N;
+    device const float* hdr = (device const float*)W;
+    const float outer = hdr[0] / hdr[1];
+    const int Kc = K >> 1, Ks = K >> 4;
+    device const uchar* p_base = W + 16;
+    device const uchar* s_base = p_base + (size_t)N * Kc;
+    device const uint2* q0p = (device const uint2*)(p_base + (size_t)row0 * Kc);
+    device const uint2* q1p = (device const uint2*)(p_base + (size_t)(row0 + (has1 ? 1 : 0)) * Kc);
+    device const uchar* s0p = s_base + (size_t)row0 * Ks;
+    device const uchar* s1p = s_base + (size_t)(row0 + (has1 ? 1 : 0)) * Ks;
+
+    if (M <= 8) {
+        float a0[8] = {0,0,0,0,0,0,0,0}, a1[8] = {0,0,0,0,0,0,0,0};
+        for (int b = int(lane); b < Ks; b += 32) {
+            float4 w00, w01, w02, w03, w10, w11, w12, w13;
+            sf4_block16(q0p[b], w00, w01, w02, w03);
+            const float sc0 = e4m3_to_f32(s0p[b]) * outer;
+            float sc1 = 0.0f;
+            if (has1) { sf4_block16(q1p[b], w10, w11, w12, w13); sc1 = e4m3_to_f32(s1p[b]) * outer; }
+            #pragma unroll 8
+            for (int i = 0; i < M; ++i) {
+                device const float4* xp = (device const float4*)(X + (size_t)i * K + b * 16);
+                const float4 x0 = xp[0], x1 = xp[1], x2 = xp[2], x3 = xp[3];
+                a0[i] = fma(sc0, dot(w00, x0) + dot(w01, x1) + dot(w02, x2) + dot(w03, x3), a0[i]);
+                if (has1) a1[i] = fma(sc1, dot(w10, x0) + dot(w11, x1) + dot(w12, x2) + dot(w13, x3), a1[i]);
+            }
+        }
+        for (int i = 0; i < M; ++i) {
+            const float v0 = simd_sum(a0[i]);
+            const float v1 = simd_sum(a1[i]);
+            if (lane == 0) {
+                Y[(size_t)i * N + row0] = v0;
+                if (has1) Y[(size_t)i * N + row0 + 1] = v1;
+            }
+        }
+        return;
+    }
+
+    for (int m0 = 0; m0 < M; m0 += 4) {
+        const int mm = min(4, M - m0);
+        float a0[4] = {0, 0, 0, 0}, a1[4] = {0, 0, 0, 0};
+        for (int b = int(lane); b < Ks; b += 32) {
+            float4 w00, w01, w02, w03, w10, w11, w12, w13;
+            sf4_block16(q0p[b], w00, w01, w02, w03);
+            const float sc0 = e4m3_to_f32(s0p[b]) * outer;
+            float sc1 = 0.0f;
+            if (has1) { sf4_block16(q1p[b], w10, w11, w12, w13); sc1 = e4m3_to_f32(s1p[b]) * outer; }
+            for (int i = 0; i < mm; ++i) {
+                device const float4* xp = (device const float4*)(X + (size_t)(m0 + i) * K + b * 16);
+                const float4 x0 = xp[0], x1 = xp[1], x2 = xp[2], x3 = xp[3];
+                a0[i] = fma(sc0, dot(w00, x0) + dot(w01, x1) + dot(w02, x2) + dot(w03, x3), a0[i]);
+                if (has1) a1[i] = fma(sc1, dot(w10, x0) + dot(w11, x1) + dot(w12, x2) + dot(w13, x3), a1[i]);
+            }
+        }
+        for (int i = 0; i < mm; ++i) {
+            const float v0 = simd_sum(a0[i]);
+            const float v1 = simd_sum(a1[i]);
+            if (lane == 0) {
+                Y[(size_t)(m0 + i) * N + row0] = v0;
+                if (has1) Y[(size_t)(m0 + i) * N + row0 + 1] = v1;
+            }
+        }
+    }
+}
+
 // ============================================================================
 // 4. Inkling-2-Mini MoE Pipeline (Register-Only Decoders + 8-Token Micro-Batching!)
 // ============================================================================

@@ -441,6 +441,7 @@ int main(int argc, char** argv) {
     int agree_n = 0;
     float ee_tau = 0.0f;
     bool do_topk_check = false;
+    bool do_lin_sf4_check = false;
     std::vector<int32_t> custom_ids;
 
     for (int i = 1; i < argc; ++i) {
@@ -472,6 +473,7 @@ int main(int argc, char** argv) {
         else if (a == "--agree") agree_n = atoi(nxt().c_str());
         else if (a == "--ee") ee_tau = (float)atof(nxt().c_str());
         else if (a == "--topk-check") do_topk_check = true;
+        else if (a == "--lin-sf4-check") do_lin_sf4_check = true;
         else if (a == "--no-warm") do_warm = false;
         else if (a == "--dump-logits") dump_logits_path = nxt();
         else if (a == "--ids") {
@@ -508,6 +510,141 @@ int main(int argc, char** argv) {
     if (!runner.init(cx, mod, max_slots, max_ctx, max_batch, want_dspark, vision_path, kernel_dir, err)) {
         fprintf(stderr, "[ERROR] runner init: %s\n", err.c_str());
         return 1;
+    }
+
+    if (do_lin_sf4_check) {
+        // SF4 (NVFP4) dense-linear kernel check on a synthetic tensor: pack N x K random
+        // weights into the canonical SF4 body on the host, run the real push_linear
+        // dispatch on GPU, compare against a double-precision host reference.
+        auto f32_to_e4m3_pos = [](float v) -> uint8_t {
+            if (v <= 0.0f) return 0;
+            if (v >= 448.0f) return 0x7E;
+            if (v < (1.0f / 64.0f)) return (uint8_t)std::max(0, std::min(7, (int)std::lround(v * 512.0f)));
+            int exp = 0;
+            float frac = std::frexp(v, &exp);
+            int e_bits = (exp - 1) + 7;
+            if (e_bits <= 0) return (uint8_t)std::max(0, std::min(7, (int)std::lround(v * 512.0f)));
+            int m = (int)std::lround((frac * 2.0f - 1.0f) * 8.0f);
+            if (m >= 8) { m = 0; ++e_bits; }
+            if (e_bits >= 15) return (e_bits == 15 && m <= 6) ? (uint8_t)((15 << 3) | m) : (uint8_t)0x7E;
+            return (uint8_t)((e_bits << 3) | (m & 7));
+        };
+        auto e4m3_pos_to_f32 = [](uint8_t b) -> float {
+            b &= 0x7F;
+            int e = (b >> 3) & 0xF, m = b & 7;
+            if (e == 0) return (float)m * (1.0f / 512.0f);
+            return std::ldexp(1.0f + (float)m * 0.125f, e - 7);
+        };
+        auto f32_to_e2m1_nib = [](float v) -> uint8_t {
+            uint8_t sign = (v < 0.0f) ? 8u : 0u;
+            float a = std::fabs(v);
+            uint8_t mag = 0u;
+            if      (a < 0.25f) mag = 0u;
+            else if (a < 0.75f) mag = 1u;
+            else if (a < 1.25f) mag = 2u;
+            else if (a < 1.75f) mag = 3u;
+            else if (a < 2.50f) mag = 4u;
+            else if (a < 3.50f) mag = 5u;
+            else if (a < 5.00f) mag = 6u;
+            else                mag = 7u;
+            return (uint8_t)(sign | mag);
+        };
+        static const float kE2M1_h[16] = {
+            0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+           -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
+        };
+        auto e4m3_lut_full = [](uint8_t c) -> float {
+            if ((c & 0x7F) == 0x7F) return 0.0f;
+            int e = (c >> 3) & 0xF, m = c & 7;
+            float v = (e == 0) ? (float)m * (1.0f / 512.0f)
+                               : std::ldexp(1.0f + (float)m * 0.125f, e - 7);
+            return (c & 0x80) ? -v : v;
+        };
+
+        std::mt19937 rng(20261128);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        int fails = 0;
+        for (int M : {1, 2, 4, 8, 12}) {
+            const int N = 129, K = 1152;
+            const float outer = 0.02083f;
+            const size_t codes_b = (size_t)N * (K / 2), scales_b = (size_t)N * (K / 16);
+            std::vector<uint8_t> body(16 + codes_b + scales_b, 0);
+            float* hdr = (float*)body.data();
+            hdr[0] = outer; hdr[1] = 1.0f; hdr[2] = 0.0f; hdr[3] = 0.0f;
+            uint8_t* pcodes = body.data() + 16;
+            uint8_t* pscales = pcodes + codes_b;
+            std::vector<float> x((size_t)M * K), wrow(K);
+            for (auto& v : x) v = nd(rng);
+            std::vector<double> ref((size_t)M * N, 0.0);
+            for (int r = 0; r < N; ++r) {
+                for (auto& v : wrow) v = nd(rng) * (float)outer;
+                uint8_t* dp = pcodes + (size_t)r * (K / 2);
+                uint8_t* ds = pscales + (size_t)r * (K / 16);
+                const int nblk = K / 16;
+                for (int b = 0; b < nblk; ++b) {
+                    const float* xr = wrow.data() + b * 16;
+                    float am = 0.0f;
+                    for (int i = 0; i < 16; ++i) am = std::max(am, std::fabs(xr[i]));
+                    uint8_t sb = f32_to_e4m3_pos((am / 6.0f) / outer);
+                    ds[b] = sb;
+                    const float sc = e4m3_pos_to_f32(sb) * outer;
+                    const float inv = (sc > 0.0f) ? (1.0f / sc) : 0.0f;
+                    for (int i = 0; i < 8; ++i) {
+                        uint8_t lo = f32_to_e2m1_nib(xr[2 * i + 0] * inv);
+                        uint8_t hi = f32_to_e2m1_nib(xr[2 * i + 1] * inv);
+                        dp[b * 8 + i] = (uint8_t)((lo & 0xF) | ((hi & 0xF) << 4));
+                    }
+                }
+                // host reference: exact dequant dot in double
+                for (int i = 0; i < M; ++i) {
+                    double acc = 0.0;
+                    for (int b = 0; b < nblk; ++b) {
+                        const float sc = e4m3_lut_full(ds[b]) * outer;
+                        for (int j = 0; j < 8; ++j) {
+                            const uint8_t pk = dp[b * 8 + j];
+                            acc += (double)sc * kE2M1_h[pk & 0xF] * x[(size_t)i * K + b * 16 + 2 * j];
+                            acc += (double)sc * kE2M1_h[pk >> 4] * x[(size_t)i * K + b * 16 + 2 * j + 1];
+                        }
+                    }
+                    ref[(size_t)i * N + r] = acc;
+                }
+            }
+            mtl::Buffer wb = cx.alloc((body.size() + 4095) & ~(size_t)4095);
+            std::memcpy(wb.ptr, body.data(), body.size());
+            mtl::Buffer xb = cx.alloc(x.size() * 4);
+            std::memcpy(xb.ptr, x.data(), x.size() * 4);
+            mtl::Buffer yb = cx.alloc((size_t)M * N * 4);
+            std::memset(yb.ptr, 0, (size_t)M * N * 4);
+
+            InkTensorInfo ti;
+            ti.name = "synth.sf4";
+            ti.fmt = FMT_SF4;
+            ti.shape = {N, K};
+            ti.bytes = body.size();
+            std::vector<mtl::Dispatch> ds;
+            runner.push_linear(ds, ti, mtl::Arg::B(wb), mtl::Arg::B(xb), mtl::Arg::B(yb), N, K, M);
+            cx.run_graph(ds);
+
+            const float* yg = (const float*)yb.ptr;
+            double max_abs = 0.0, max_rel = 0.0;
+            int bad = 0;
+            for (int i = 0; i < M; ++i) {
+                for (int r = 0; r < N; ++r) {
+                    const double e = ref[(size_t)i * N + r];
+                    const double d = std::fabs((double)yg[(size_t)i * N + r] - e);
+                    const double rl = d / std::max(1e-6, std::fabs(e));
+                    max_abs = std::max(max_abs, d);
+                    max_rel = std::max(max_rel, rl);
+                    if (d > 1e-2 && rl > 1e-2) ++bad;
+                }
+            }
+            printf("[SF4-CHECK] M=%d N=%d K=%d kernel=%s max_abs=%.3e max_rel=%.3e bad=%d %s\n",
+                   M, N, K, (M == 1 ? "mv1" : "mv"), max_abs, max_rel, bad, bad ? "FAIL" : "OK");
+            if (bad) fails += bad;
+            cx.free(wb); cx.free(xb); cx.free(yb);
+        }
+        if (fails) { fprintf(stderr, "[SF4-CHECK] FAILED: %d mismatched outputs\n", fails); return 1; }
+        printf("[SF4-CHECK] PASS: all kernel outputs match host dequant reference\n");
     }
 
     // Optional Vision test

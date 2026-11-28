@@ -2023,3 +2023,23 @@ serve block/spec_batch 的 partial-accept 分支:`rq.next_tok = best` 被设置�
 - `--topk-check`:fused vs full argmax 行对比 + tk_part/fk_a/fk_b/fk_out 探针
 - `--agree`/`--ee`:per-pass argmax/prob 转储与预 coda 早退测量(上一提交)
 - 病灶特征库:pass-3 argmax 翻转集中在 prob<0.4 近并列 token
+
+## 2026-11-28 nvfp4/SF4 dense trunk en Metal(M1 Max):kernels + repack + benchmark
+
+### Implementado
+- `ink_linear_sf4_mv1`/`ink_linear_sf4_mv` en `ink_metal_codecs.metal`:GEMV denso para body `[16B hdr(amax/denom)][N×K/2 E2M1 codes][N×K/16 E4M3 scales]`(el mismo de `dot_sf4_f32_row`/experts).1 bloque-16 por lane-iter(8B codes + 1B scale).`push_linear` despacha `FMT_SF4`(antes `exit(2)`).
+- `ink_mpp_sf4_to_f16` en `ink_metal_mpp.metal`:descompresión SF4→f16 para el path MPP(`cvt_tensor` dejaba `d.p=null` → **crash en init con trunk SF4 si MPP activo**).Bug real encontrado via repack test.
+- `--lin-sf4-check`:synthetic-pack CLI check(GPU kernel vs referencia host doble,M=1..12).
+- `terminal/tools/inkling_sf4_repack.py`:repack `.strata` Q8_ROW→SF4 con `StrataWriter`(secciones 3/4/5 verbatim,manifest reindexado).
+
+### Mediciones(M1 Max,sq10-sf4trunk.strata = 132 attn projections requantificadas,-260MB/token trunk)
+- `[SF4-CHECK]` 5/5 rutas OK,max_abs 2.5e-07.
+- Selfcheck SF4 pack:sin NaN,top1=220(mismo token que Q8;probs difieren ±0.13 por requant).
+- `--draft off` decode:SF4 **32.4-32.5** vs Q8 **32.1-32.2 tok/s** → **+~1% solamente**.
+- Prefill:145 vs 15.8 ppts(mismo número de pasadas;medición ruidosa).
+- **Interpretación**:el trunk-attn ~1.03GB se amortiza en M=1 pero es ~25-30% del tráfico total/token;su -40% ⇒ ~1% real.El cuello real está en expertos MoE + unembed S6(~200MB/tok).SF4 trunk es ganancia real pero pequeña;el palo grande sería unembed SF4(SENSITIVE,requiere QAD/QA,postergado).
+- Requant Q8→SF4 rms_err ≈9.4% → el pack repackeado **desactiva el drafter**(acc=0/124,la distribución cambió).Solo vale para validar path/velocidad,no para producción.Producción exige los SF4 nativos del checkpoint original.
+
+### Estado
+- `sq10-sf4trunk.strata`(9.29GB)generado en `~/dageno-modelbench/` como artefacto de validación.
+- Siguiente palanca:unembed S6→SF4 con QA;DSA swap del SWA;dspark-distill(DFlash)para acc%.
