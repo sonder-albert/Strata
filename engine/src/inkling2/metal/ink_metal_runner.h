@@ -2432,6 +2432,7 @@ long ee_fired = 0, ee_total = 0, ee_passes_run = 0;   // early-exit counters (ru
                 } else if (step.want_topk && uti.fmt == FMT_S6 && n_lg >= 5 && n_lg <= 16) {
                     static bool logged_fused = false;
                     if (!logged_fused) { std::fprintf(stderr, "[ink] fused unembed+topk active (n_lg=%d)\n", n_lg); logged_fused = true; }
+                    const size_t ds_mark = ds.size();
                     // FUSED unembed+topk: weights pass identically to mm8 below (bit-identical GEMM), but the
                     // [M,V] logits are never written - per-tile sorted top-128 keys go to bd_tk_part and the
                     // merge tree reduces them in-graph. Final keys land in bd_fk_out, one row per n_lg row.
@@ -2454,13 +2455,14 @@ long ee_fired = 0, ee_total = 0, ee_passes_run = 0;   // early-exit counters (ru
                     int lists = n_tiles;
                     mtl::Buffer* in = &bd_tk_part;
                     mtl::Buffer* outp = &bd_fk_a;
-                    bool first_merge = true;
                     while (lists > 1) {
                         const int groups = (lists + 15) / 16;
                         mtl::Dispatch dm;
                         dm.p = &p_unemb_topk_merge;
-                        dm.barrier = first_merge;
-                        first_merge = false;
+                        // every level MUST barrier: ping-pong in/out are the same buffers each pass,
+                        // and without the barrier a later level reads/writes while an earlier level is
+                        // still writing (concurrent encoder) - observed: row0's first 8 groups of fk_a
+                        // silently dropped (raced with the level-3 write into the same region).
                         dm.grid[0] = (uint32_t)groups; dm.grid[1] = (uint32_t)n_lg;
                         dm.tg[0] = 256;
                         dm.args = {mtl::Arg::B(*in), mtl::Arg::B(*outp),
@@ -2478,6 +2480,16 @@ long ee_fired = 0, ee_total = 0, ee_passes_run = 0;   // early-exit counters (ru
                         dc.args = {mtl::Arg::B(*in), mtl::Arg::B(bd_fk_out),
                                    mtl::Arg::V(1), mtl::Arg::V(1), mtl::Arg::V(1)};
                         ds.push_back(std::move(dc));
+                    }
+                    static bool dbg_fused = std::getenv("INK_TOPK_DEBUG") != nullptr;
+                    if (dbg_fused) {
+                        int nm = 0;
+                        for (size_t di = ds_mark; di < ds.size(); ++di) {
+                            const char* nm0 = ds[di].p ? ds[di].p->name.c_str() : "?";
+                            if (std::string(nm0).find("topk") != std::string::npos) ++nm;
+                        }
+                        std::fprintf(stderr, "[ink TOPKDBG] fused block: %zu dispatches, %d topk, ds_size=%zu in=%s\n",
+                                     ds.size() - ds_mark, nm, ds.size(), in == &bd_fk_out ? "out" : (in == &bd_fk_a ? "a" : "b"));
                     }
                 } else {
                     // For M=5..8 S6_K unembed, use mm8 (1.56 ms vs 2.60 ms mv!); for M=9..16 S6_K, split into two mm8 calls (3.1 ms vs 5.25 ms!)

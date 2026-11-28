@@ -440,6 +440,7 @@ int main(int argc, char** argv) {
     bool do_warm = true;
     int agree_n = 0;
     float ee_tau = 0.0f;
+    bool do_topk_check = false;
     std::vector<int32_t> custom_ids;
 
     for (int i = 1; i < argc; ++i) {
@@ -470,6 +471,7 @@ int main(int argc, char** argv) {
         else if (a == "--par-sweep") { do_par_sweep = true; if (max_slots < 64) max_slots = 64; }
         else if (a == "--agree") agree_n = atoi(nxt().c_str());
         else if (a == "--ee") ee_tau = (float)atof(nxt().c_str());
+        else if (a == "--topk-check") do_topk_check = true;
         else if (a == "--no-warm") do_warm = false;
         else if (a == "--dump-logits") dump_logits_path = nxt();
         else if (a == "--ids") {
@@ -745,6 +747,93 @@ int main(int argc, char** argv) {
                ef, et, 100.0 * ef / std::max<long>(et, 1), ep, et * 3);
         if (match != ncmp) printf("  first diff @%d: ref=%d ee=%d\n", match, ref_ids[match], ee_ids[match]);
         runner.early_exit_tau = 0.0f;
+    }
+
+    if (do_topk_check) {
+        // Fused unembed+topk parity: same 8-row batch through (a) full logits + argmax and
+        // (b) want_topk -> bd_fk_out first key. Reproduces the "token id -1" verify bug.
+        const int R = 8;
+        runner.reset_slot(0);
+        const int P = (int)custom_ids.size();
+        // feed prompt, then R rows: prompt tail + first ref tokens so rows are real context
+        {
+            InkBatchStep st;
+            st.M = P;
+            st.slot_ids.assign(P, 0);
+            st.pos.resize(P);
+            st.tok_ids = custom_ids;
+            for (int i = 0; i < P; ++i) st.pos[i] = i;
+            st.compute_logits = false;
+            if (!runner.forward_batch(st, nullptr, nullptr, err)) { fprintf(stderr, "[ERR] %s\n", err.c_str()); return 1; }
+        }
+        auto run_rows = [&](bool topk, std::vector<int32_t>& out, int32_t feed) {
+            InkBatchStep st;
+            st.M = R;
+            st.slot_ids.assign(R, 0);
+            st.pos.resize(R);
+            st.tok_ids.assign(R, feed);
+            for (int i = 0; i < R; ++i) st.pos[i] = P + i;
+            st.compute_logits = true;
+            st.want_topk = topk;
+            if (topk) {
+                if (!runner.forward_batch(st, nullptr, nullptr, err)) return false;
+                const uint64_t* keys = (const uint64_t*)runner.bd_fk_out.ptr;
+                out.resize(R);
+                for (int r = 0; r < R; ++r)
+                    out[r] = (int32_t)(0xFFFFFFFFu - (uint32_t)(keys[(size_t)r * 128] & 0xFFFFFFFFull));
+            } else {
+                out.assign(R, -2);
+                return runner.forward_batch(st, nullptr, out.data(), err);
+            }
+            return true;
+        };
+        std::vector<int32_t> full, fused;
+        if (!run_rows(false, full, 15496)) { fprintf(stderr, "[ERR full] %s\n", err.c_str()); return 1; }
+        // restore context: the full pass already wrote these rows' states; topk run overwrites same positions
+        if (!run_rows(true, fused, 15496)) { fprintf(stderr, "[ERR fused] %s\n", err.c_str()); return 1; }
+        // pipeline probes: which stage produced keys?
+        {
+            const uint64_t* pt = (const uint64_t*)runner.bd_tk_part.ptr;
+            const uint64_t* fa = (const uint64_t*)runner.bd_fk_a.ptr;
+            const uint64_t* fb = (const uint64_t*)runner.bd_fk_b.ptr;
+            auto nz = [](const uint64_t* p, int n) { int c = 0; for (int i = 0; i < n; ++i) if (p[i]) ++c; return c; };
+            // row0 level-1 output should live in fk_a[0 .. 196*128); level-2 in fk_b[0 .. 13*128)
+            printf("[TOPK-PROBE] tk_part nz=%d/1024 | fk_a nz=%d/25088 fk_b nz=%d/25088 | pt0=%016lx fa0=%016lx fa[128]=%016lx fb0=%016lx\n",
+                   nz(pt, 1024), nz(fa, 25088), nz(fb, 25088),
+                   (unsigned long)pt[0], (unsigned long)fa[0], (unsigned long)fa[128], (unsigned long)fb[0]);
+            const uint64_t* fo = (const uint64_t*)runner.bd_fk_out.ptr;
+            for (int r = 0; r < 8; ++r)
+                printf("  fk_out row%d key0=%016lx -> tok %d\n", r, (unsigned long)fo[(size_t)r*128],
+                       (int32_t)(0xFFFFFFFFu - (uint32_t)(fo[(size_t)r*128] & 0xFFFFFFFFull)));
+            // first nonzero group per row in fk_a (row stride = 196 groups x 128)
+            for (int r = 0; r < 8; ++r) {
+                int first_g = -1, last_g = -1, z = 0;
+                for (int g = 0; g < 196; ++g) {
+                    bool any = false;
+                    for (int i = 0; i < 128; ++i) if (fa[(size_t)r * 196 * 128 + (size_t)g * 128 + i]) { any = true; break; }
+                    if (any) { if (first_g < 0) first_g = g; last_g = g; } else ++z;
+                }
+                printf("  fk_a row%d: first_nz_g=%d last_nz_g=%d zero_groups=%d\n", r, first_g, last_g, z);
+            }
+            // and fk_b (13 groups/row)
+            for (int r = 0; r < 8; ++r) {
+                int first_g = -1, z = 0;
+                for (int g = 0; g < 13; ++g) {
+                    bool any = false;
+                    for (int i = 0; i < 128; ++i) if (fb[(size_t)r * 13 * 128 + (size_t)g * 128 + i]) { any = true; break; }
+                    if (any) { if (first_g < 0) first_g = g; } else ++z;
+                }
+                printf("  fk_b row%d: first_nz_g=%d zero_groups=%d\n", r, first_g, z);
+            }
+        }
+        printf("[TOPK-CHECK] rows=%d\n", R);
+        int bad = 0;
+        for (int r = 0; r < R; ++r) {
+            const char* tag = (full[r] == fused[r]) ? "ok" : "DIFF";
+            if (full[r] != fused[r]) ++bad;
+            printf("  row%d full=%d fused=%d %s\n", r, full[r], fused[r], tag);
+        }
+        printf("[TOPK-CHECK] %d/%d mismatched\n", bad, R);
     }
 
     return 0;

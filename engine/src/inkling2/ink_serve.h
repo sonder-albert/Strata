@@ -1085,9 +1085,10 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                             // correct position, capture_taps on. its logits row re-predicts the continuation;
                             // greedy argmax of it is the true next token. state after it is the correct
                             // continuation state - NO rollback needed (and none wanted: a ring hit would be wrong).
+                            const int32_t repair_in = rq.next_tok;   // input fed at pos0+accepted (= ver_ids[accepted-1])
                             StepBatch rb;
                             rb.capture_taps = true;
-                            rb.push(rq.slot, rq.cur_pos + accepted, rq.next_tok, true);
+                            rb.push(rq.slot, rq.cur_pos + accepted, repair_in, true);
                             std::string rerr;
                             std::vector<float> rlg((size_t)V);
                             if (backend.forward_batch(rb, rlg.data(), nullptr, rerr)) {
@@ -1095,11 +1096,30 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                                 for (int v = 1; v < V; ++v) if (rlg[v] > rlg[best]) best = v;
                                 rq.next_tok = best;
                                 ++accepted;      // the repair step also feeds the bonus token: position advances past it
+                                // cached_prefix holds one entry per trunk-committed input. The emit loop
+                                // pushed the kept row inputs only (anchor + drafts up to the rejected row's
+                                // predecessor); the repair feed's input is the missing one.
+                                rq.cached_prefix.push_back(repair_in);
+                                // `best` is the prediction for pos0+accepted+1 - a real output token that
+                                // was never emitted (the verify loop only emits ver_ids rows). Emit it now:
+                                // same bookkeeping as the emit loop + is the already-fed input token for the
+                                // next decode step. Without this the stream loses one token per partial accept
+                                // and every following prediction indexes into a one-hole-short history.
+                                rq.hist.push_back(best);
+                                rq.gen_ids.push_back(best);
+                                ++rq.generated;
+                                if (rq.is_solo) proto("T %d", best);
+                                else if (rq.is_ext_gen) proto("T %s %d", rq.req_id.c_str(), best);
+                                else proto("BT %d %d", rq.slot, best);
+                                if (is_stop_tok(best)) { fin = "stop"; done = true; }
+                                else if (rq.generated >= rq.max_new) { fin = "length"; done = true; }
+                                else if (cfg.anti_loop && detect_repetition_loop(rq.gen_ids)) { fin = "stop"; done = true; }
                             }
                         }
                     }
                     rq.cur_pos += accepted;
                     if (spec_adapt) gov_step(rq, accepted, (now_s() - gov_b0) * 1000.0);
+                    if (fin) finish_req(rq, fin);
                 } else if (fin) {
                     finish_req(rq, fin);
                 }
@@ -1204,9 +1224,42 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                         }
                         row_off += nd + 1;
                         if (!done) {
-                            if (accepted <= nd) backend.rollback_slot(rq.slot, rq.cur_pos + accepted);
+                            if (accepted <= nd) {
+                                backend.rollback_slot(rq.slot, rq.cur_pos + accepted);
+                                // Same repair contract as the single-slot block path above (#rejfix + #emitfix):
+                                // feed the rejected row's correct token (ver_ids[accepted-1], already in
+                                // rq.next_tok) with tap capture to repair the poisoned dsp_ctx entry, take
+                                // the re-predicted continuation, and EMIT it - it is a real output token the
+                                // verify loop does not cover.
+                                if (accepted >= 1 && accepted <= nd) {
+                                    const int32_t repair_in = rq.next_tok;
+                                    StepBatch rb;
+                                    rb.capture_taps = true;
+                                    rb.push(rq.slot, rq.cur_pos + accepted, repair_in, true);
+                                    std::string rerr;
+                                    std::vector<float> rlg((size_t)V);
+                                    if (backend.forward_batch(rb, rlg.data(), nullptr, rerr)) {
+                                        int32_t best = 0;
+                                        for (int v = 1; v < V; ++v) if (rlg[v] > rlg[best]) best = v;
+                                        rq.next_tok = best;
+                                        ++accepted;
+                                        rq.cached_prefix.push_back(repair_in);
+                                        rq.hist.push_back(best);
+                                        rq.gen_ids.push_back(best);
+                                        ++rq.generated;
+                                        any_emitted = true;
+                                        if (rq.is_solo) proto("T %d", best);
+                                        else if (rq.is_ext_gen) proto("T %s %d", rq.req_id.c_str(), best);
+                                        else proto("BT %d %d", rq.slot, best);
+                                        if (is_stop_tok(best)) { fin = "stop"; done = true; }
+                                        else if (rq.generated >= rq.max_new) { fin = "length"; done = true; }
+                                        else if (cfg.anti_loop && detect_repetition_loop(rq.gen_ids)) { fin = "stop"; done = true; }
+                                    }
+                                }
+                            }
                             rq.cur_pos += accepted;
                             if (spec_adapt) gov_step(rq, accepted, spec_ms);
+                            if (fin) finish_req(rq, fin);
                         } else if (fin) {
                             finish_req(rq, fin);
                         }
