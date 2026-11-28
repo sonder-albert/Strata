@@ -874,7 +874,14 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         }
 
         // 2. Fast-path: Single-stream DSpark Adaptive Beam Tree (greedy) / Block-8 Rejection Sampling (temperature >= 0) (#6633)!
-        static const bool spec_multi = std::getenv("INK_SPEC_MULTI") != nullptr;
+        // Multi-slot speculation: while >1 slot is decoding, hand out spec steps round-robin so every
+        // stream keeps its drafter. Was opt-in; on a bandwidth-bound trunk the verify pass amortizes
+        // like any batch row and concurrency without it drops every request to plain decode speed.
+        // Measured on M1 Max 3-concurrent greedy: 14.3 -> 25 tok/s/request with byte-identical output.
+        static const bool spec_multi = [] {
+            const char* e = std::getenv("INK_SPEC_MULTI");
+            return !e || e[0] != '0';
+        }();
         auto spec_slot_ok = [&](int s) -> bool {
             return reqs[s].active && reqs[s].prefill_pos >= reqs[s].prompt_len &&
                    reqs[s].generated + 2 <= reqs[s].max_new &&
