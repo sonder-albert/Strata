@@ -2002,3 +2002,24 @@ INK_AGREE_DUMP=/tmp/ag ./strata-inkling-metal --native sq10.strata --parallel 1 
   --agree 192 --ids "<chat_tokens.py ids>"
 ./strata-inkling-metal --native sq10.strata --draft off --gen 96 --ee 0.80 --ids "..."
 ```
+
+## 2026-11-28 host-verify 修复实录(M1 Max):两个真 bug,block 模式全链修通
+
+### Bug 1: repair `best` token 漏发(输出垃圾的主因)
+serve block/spec_batch 的 partial-accept 分支:`rq.next_tok = best` 被设置但从未 emit——`proto("T")`/`gen_ids`/`hist`/`cached_prefix` 全部缺这一格。每次部分接受输出流漏一个 token,症状是"每个 token 都是真字但串不成句"。修复(7543f46):emit best + `cached_prefix.push(repair_in)` + `fin→finish_req`;spec_batch 合并路径连 repair forward 都没有,同补丁补齐。
+**诊断教训**:把"接受率低"和"输出垃圾"分开归因——它们是两个不同 bug。vdebug REJ 行显示 i=0..6 分散的正常拒绝,垃圾输出另有其因。
+
+### Bug 2: fused unembed+topk merge 链 barrier 缺失(token id -1)
+`dm.barrier = first_merge` 只给第一级屏障;level-2..N 和最终拷贝在 concurrent encoder 里无屏障跑,ping-pong 同一缓冲 → level-3 写 fk_a 与 level-1 同区并发 → fk_a 行 0 前 8 组(恰好 level-3 输出区)全零 → `bd_fk_out` 零 key → tok -1。**修复:每级都 barrier**。用 --topk-check 缓冲探针定位:tk_part 有真 key → fk_a 部分零 → fk_b 部分零 → fk_out 全零,恰好暴露竞争。
+**方法论**:M>1 verify 输出不对时,先 dump 各级 scratch 缓冲做断点二分,不要猜 kernel 数学。
+
+### 修后状态
+- block 全行路径与 tree 逐字节一致;amax(fused)路径输出连贯、27.9-28.1 tok/s
+- spec_batch 3 并发正确连贯(近并列 token 批间微差,无系统性崩坏)
+- block 模式现在正确但**不比 tree 快**(nd=7 固定深链 vs tree 动态预算);默认仍走 tree
+- 接受率 ~30-50% @nd7;dspark 蒸馏(DFlash 配方)仍是提接受率的主轴,训练项远期
+
+### 工具沉淀
+- `--topk-check`:fused vs full argmax 行对比 + tk_part/fk_a/fk_b/fk_out 探针
+- `--agree`/`--ee`:per-pass argmax/prob 转储与预 coda 早退测量(上一提交)
+- 病灶特征库:pass-3 argmax 翻转集中在 prob<0.4 近并列 token
