@@ -2730,14 +2730,15 @@ struct InkMetalRunner {
             static double tot = 0;
             ++stepn;
             const int32_t* tr = b_topk_trace.as<int32_t>();
+            const size_t tstride = (size_t)max_batch * c.top_k;   // same stride the capture dispatch uses
             for (int li = 0; li < 12; ++li) {
                 int v0 = 6 + li, v1 = 18 + li, v2 = 30 + li;
                 int cnt[3] = {};
                 for (int a = 0; a < 8; ++a) {
                     for (int b = 0; b < 8; ++b) {
-                        if (tr[v0 * 8 + a] == tr[v1 * 8 + b]) ++cnt[0];
-                        if (tr[v0 * 8 + a] == tr[v2 * 8 + b]) ++cnt[1];
-                        if (tr[v1 * 8 + a] == tr[v2 * 8 + b]) ++cnt[2];
+                        if (tr[v0 * tstride + a] == tr[v1 * tstride + b]) ++cnt[0];
+                        if (tr[v0 * tstride + a] == tr[v2 * tstride + b]) ++cnt[1];
+                        if (tr[v1 * tstride + a] == tr[v2 * tstride + b]) ++cnt[2];
                     }
                 }
                 for (int q = 0; q < 3; ++q) acc[q] += cnt[q];
