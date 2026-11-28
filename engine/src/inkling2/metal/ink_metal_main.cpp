@@ -443,6 +443,8 @@ int main(int argc, char** argv) {
     bool do_topk_check = false;
     bool do_lin_sf4_check = false;
     std::vector<int32_t> custom_ids;
+    std::string tap_collect_path;   // file with space/comma-separated token id sequences (blank line = boundary)
+    std::string tap_meta_path;      // sidecar: seq boundaries (offset/rows) for the INK_TAPDUMP stream
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -476,6 +478,8 @@ int main(int argc, char** argv) {
         else if (a == "--lin-sf4-check") do_lin_sf4_check = true;
         else if (a == "--no-warm") do_warm = false;
         else if (a == "--dump-logits") dump_logits_path = nxt();
+        else if (a == "--tap-collect") tap_collect_path = nxt();
+        else if (a == "--tap-meta") tap_meta_path = nxt();
         else if (a == "--ids") {
             std::stringstream ss(nxt());
             std::string tok;
@@ -971,6 +975,49 @@ int main(int argc, char** argv) {
             printf("  row%d full=%d fused=%d %s\n", r, full[r], fused[r], tag);
         }
         printf("[TOPK-CHECK] %d/%d mismatched\n", bad, R);
+    }
+
+    if (!tap_collect_path.empty()) {
+        // On-policy distill-tap collection: for each sequence in the file, run a plain
+        // greedy decode (no spec) so every position's b_cur/b_h_norm snapshot lands in
+        // the INK_TAPDUMP stream (int32 pos + int32 tok + 4*D fp32 per row). The sidecar
+        // meta file records per-sequence row counts so the consumer can slice the stream
+        // without sentinels: "seq <idx> <n_rows> <prompt_len> <gen_len>\n".
+        std::ifstream in(tap_collect_path);
+        if (!in) { fprintf(stderr, "[ERROR] cannot open %s\n", tap_collect_path.c_str()); return 1; }
+        FILE* mf = tap_meta_path.empty() ? nullptr : std::fopen(tap_meta_path.c_str(), "ab");
+        if (tap_meta_path.size() && !mf) { fprintf(stderr, "[ERROR] cannot open meta %s\n", tap_meta_path.c_str()); return 1; }
+        std::string line;
+        int si = 0;
+        double t_all = mtl::now_s();
+        while (std::getline(in, line)) {
+            for (char& ch : line) if (ch == ',') ch = ' ';
+            std::stringstream ls(line);
+            std::vector<int32_t> seq;
+            int64_t v;
+            while (ls >> v) seq.push_back((int32_t)v);
+            if (seq.empty()) continue;
+            if ((int)seq.size() + gen_n + 2 > runner.max_ctx) {
+                fprintf(stderr, "[TAP] seq %d skipped: len=%zu > ctx\n", si, seq.size());
+                ++si; continue;
+            }
+            std::vector<int32_t> out_ids;
+            double pm = 0, dm = 0; int acc = 0, off = 0;
+            if (!run_greedy_decode(runner, 0, seq, gen_n, false, out_ids, pm, dm, acc, off, err, 0)) {
+                fprintf(stderr, "[ERROR] tap-collect seq %d: %s\n", si, err.c_str());
+                if (mf) std::fclose(mf);
+                return 1;
+            }
+            // The final generated token is appended without a forward (decode loop stops
+            // when out_ids reaches max_new), so the dump holds P + G - 1 rows.
+            const int rows = (int)seq.size() + (int)out_ids.size() - 1;
+            if (mf) std::fprintf(mf, "seq %d %d %d %d\n", si, rows, (int)seq.size(), (int)out_ids.size());
+            fprintf(stderr, "[TAP] seq %d: P=%d G=%d (%.1f ms prefill, %.1f ms decode)\n",
+                    si, (int)seq.size(), (int)out_ids.size(), pm, dm);
+            ++si;
+        }
+        if (mf) std::fclose(mf);
+        fprintf(stderr, "[TAP] done: %d seqs in %.1f s\n", si, mtl::now_s() - t_all);
     }
 
     return 0;
