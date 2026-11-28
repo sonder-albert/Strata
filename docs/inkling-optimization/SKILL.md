@@ -2043,3 +2043,38 @@ serve block/spec_batch 的 partial-accept 分支:`rq.next_tok = best` 被设置�
 ### Estado
 - `sq10-sf4trunk.strata`(9.29GB)generado en `~/dageno-modelbench/` como artefacto de validación.
 - Siguiente palanca:unembed S6→SF4 con QA;DSA swap del SWA;dspark-distill(DFlash)para acc%.
+
+## On-policy tap collection pipeline (2026-11-28, M1 Max) — distilled_windows producer
+
+`INK_TAPDUMP=<file>` (ink_metal_runner.h): appends per forward row
+`int32 pos + int32 tok + 4*2304 fp32` = taps at visits {5,23,41} of b_cur + final
+b_h_norm, for BOTH prefill and decode rows. One forward covers a whole window -
+no replay pass needed.
+
+`--tap-collect FILE` + `--tap-meta FILE` (ink_metal_main.cpp): reads space/comma-
+separated id sequences (one per line), runs greedy decode with `--draft off` for
+each in a single engine process (weights loaded once). Meta records
+`seq <i> <n_rows> <prompt_len> <gen_len>`; n_rows = P+G-1 (the last generated
+token is emitted without a forward). Driver: `terminal/tools/inkling_tap_collect.py`
+- tokenizer: strata_tokenizer.py loading the pack's tok dir (vocab.json+merges.txt
+  +token_type.json, same path as serve/server.py); BOS=200028 prepended by hand
+  (add_bos_token=false), chat shape = <|message_user|><|content_text|>text
+  <|end_message|><|message_model|>, default 40% of prompts.
+- corpus: fineweb sample-10BT shard via HTTP Range reads (shards ~2GB; fetch only
+  the thrift footer + first row groups, ~5-10MB). Needs `--proxy http://127.0.0.1:7897`
+  on this host (Clash Verge; urllib's TLS dies through it - curl subprocess works).
+  datasets-server.hf.co is SSL-blocked; hf.co works at ~150-500KB/s through proxy.
+- output: distill_windows.npz {taps[N,W,4,2304] fp32, tokens[N,W] int32,
+  is_generated[N,W] bool, src[N,3]=(seq_idx,window_start,prompt_len)}.
+  W=77 stride=37 matches the M6 distill_windows.npz geometry.
+- smoke-verified on sq10.strata: 3 seqs, taps dense rms 2.8-4.7, generated text
+  coherent incl. <|content_thinking|> after chat prompts.
+
+Memory discipline: run with the :8392 serve engine STOPPED (32GB host; two
+locked instances risk the watchdog). nohup/& children get reaped with the
+spawning shell on this harness - run the collector in a held session or
+foreground, not detached.
+
+M6 unreachable via ssh 192.168.64.2 (timeout) - npz key names beyond
+taps/tokens/src must be verified against dflash2_train.py on M6 when reachable;
+taps+tokens are the load-bearing keys either way.
