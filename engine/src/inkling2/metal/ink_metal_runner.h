@@ -463,6 +463,39 @@ struct InkMetalRunner {
             swa_ring = std::max(ring, std::min(win, max_ctx));
             swa_span_cap = (swa_ring > win && swa_ring < max_ctx) ? (swa_ring - win) : 0;
         }
+        // Slot budget clamp: KV + ShortConv scale linearly in max_slots at the ctx and ring width
+        // settled above; an over-wide --parallel silently blew the working set (64 slots x 4096 ctx
+        // needed ~21 GiB KV alone -> kIOGPUCommandBufferCallbackErrorOutOfMemory). Shrink slots to what
+        // the budget fits. STRATA_INK_KV_MB pins the state budget (default: half the working set);
+        // STRATA_INK_SLOTS pins the floor the clamp may not go below (default 8).
+        {
+            const uint64_t ws_lim = cx->recommended_working_set();
+            uint64_t kv_budget = std::max<uint64_t>(1ull << 30, ws_lim / 2);
+            if (const char* ev = std::getenv("STRATA_INK_KV_MB")) {
+                const long v = std::atol(ev);
+                if (v >= 256) kv_budget = (uint64_t)v << 20;
+            }
+            const int min_slots = [] { const char* e = std::getenv("STRATA_INK_SLOTS"); return e ? std::max(1, std::atoi(e)) : 8; }();
+            // Exact mirror of the allocation loop below: per-visit stride is swa_ring for SWA
+            // visits, max_ctx for global ones; K and V each n_kv*head_dim uint16 per slot.
+            uint64_t per_slot_b = 0;
+            for (int v = 0; v < c.n_visits; ++v) {
+                const int ip = c.phys_for_visit(v);
+                const int stride = c.is_swa[ip] ? swa_ring : max_ctx;
+                per_slot_b += 2ull * (uint64_t)stride * c.n_kv * c.head_dim * 2ull;
+            }
+            per_slot_b += (uint64_t)c.n_visits * 3ull * (2ull * c.n_kv * c.head_dim + 2ull * c.hidden) * 4ull;
+            const uint64_t want = per_slot_b * (uint64_t)max_slots;
+            if (max_slots > 1 && want > kv_budget) {
+                int fit = (int)std::min<uint64_t>((uint64_t)max_slots, kv_budget / std::max<uint64_t>(per_slot_b, 1));
+                fit = std::max(fit, std::min(min_slots, max_slots));
+                if (fit < max_slots) {
+                    fprintf(stderr, "[ink_metal] KV/ShortConv budget clamp: slots %d -> %d (state %.1f GiB > budget %.1f GiB; STRATA_INK_KV_MB/STRATA_INK_SLOTS to override)\n",
+                            max_slots, fit, want / 1073741824.0, kv_budget / 1073741824.0);
+                    max_slots = fit;
+                }
+            }
+        }
         kv_k.resize(c.n_visits);
         kv_v.resize(c.n_visits);
         visit_kv_stride.resize(c.n_visits);
