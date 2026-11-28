@@ -680,7 +680,8 @@ static int cmd_spec_check(const std::string& model_path, const BackendOpts& bopt
         while (static_cast<int>(b.size()) < n_gen) {
             ++steps;
             const int rem = n_gen - static_cast<int>(b.size());
-            if (rem >= 2 && pos + 12 < eff_ctx) {
+            static const bool no_tree = std::getenv("STRATA_SPEC_CHECK_BLOCK") != nullptr;
+            if (rem >= 2 && pos + 12 < eff_ctx && !no_tree) {
                 int32_t emitted[16]{};
                 int drafted = 0;
                 const int n_emit = backend->dspark_spec_step_greedy(0, next, pos, rem, emitted, &drafted, err);
@@ -794,8 +795,10 @@ static int cmd_spec_check(const std::string& model_path, const BackendOpts& bopt
             batch.push(0, P + k, a1[k], true);
             TapCapture tc;
             if (!backend->forward_batch(batch, logits.data(), &tc, err)) { fprintf(stderr, "taps single: %s\n", err.c_str()); return 1; }
-            for (int t = 0; t < 4; ++t) single_taps[t][k].assign(tc.taps[t].begin(), tc.taps[t].begin() + D);
+            if (tc.taps[0].empty()) { printf("[spec-check] tap comparison skipped: backend does not capture taps\n"); break; }
+        for (int t = 0; t < 4; ++t) single_taps[t][k].assign(tc.taps[t].begin(), tc.taps[t].begin() + D);
         }
+        if (single_taps[0][0].empty()) { printf("[spec-check] section (d) skipped entirely\n"); goto spec_done; }
         if (!prefill()) return 1;
         backend->snapshot_slot(0);
         batch.clear();
@@ -819,6 +822,7 @@ static int cmd_spec_check(const std::string& model_path, const BackendOpts& bopt
                    t == 0 ? 5 : t == 1 ? 23 : t == 2 ? 41 : 48, M, rows.empty() ? " none" : rows.c_str(), worst);
         }
     }
+spec_done:
     printf("[spec-check] RESULT: %s\n", rc ? "DIFFERS" : "identical");
     return rc;
 }

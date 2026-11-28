@@ -267,6 +267,46 @@ kernel void ink_mpp_q8row_to_f16(
     if (k < K) dst[(size_t)r * K + k] = half(float(row[k]) * sc);
 }
 
+// SF4 (NVFP4 dense body: [16B hdr][N x K/2 E2M1 codes][N x K/16 E4M3 scales]) -> FP16
+// Each thread writes one 16-weight block: 8B codes (uint2) + 1B block scale.
+kernel void ink_mpp_sf4_to_f16(
+    device const uchar* W [[buffer(0)]],
+    device half* dst      [[buffer(1)]],
+    constant int& N       [[buffer(2)]],
+    constant int& K       [[buffer(3)]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    const int r = int(tgp.y);
+    if (r >= N) return;
+    const int nb = K >> 4;
+    const int b = int(tgp.x) * 256 + int(tid);
+    if (b >= nb) return;
+    device const float* hdr = (device const float*)W;
+    const float outer = hdr[0] / hdr[1];
+    const int Kc = K >> 1;
+    device const uchar* p_base = W + 16;
+    device const uchar* s_base = p_base + (size_t)N * Kc;
+    const uint2 bg = *((device const uint2*)(p_base + (size_t)r * Kc + b * 8));
+    const float sc = mpp_e4m3_to_f32(s_base[(size_t)r * nb + b]) * outer;
+    device half* out = dst + (size_t)r * K + b * 16;
+    out[0]  = half(kMppE2M1[bg.x & 15u] * sc);
+    out[1]  = half(kMppE2M1[(bg.x >> 4) & 15u] * sc);
+    out[2]  = half(kMppE2M1[(bg.x >> 8) & 15u] * sc);
+    out[3]  = half(kMppE2M1[(bg.x >> 12) & 15u] * sc);
+    out[4]  = half(kMppE2M1[(bg.x >> 16) & 15u] * sc);
+    out[5]  = half(kMppE2M1[(bg.x >> 20) & 15u] * sc);
+    out[6]  = half(kMppE2M1[(bg.x >> 24) & 15u] * sc);
+    out[7]  = half(kMppE2M1[bg.x >> 28] * sc);
+    out[8]  = half(kMppE2M1[bg.y & 15u] * sc);
+    out[9]  = half(kMppE2M1[(bg.y >> 4) & 15u] * sc);
+    out[10] = half(kMppE2M1[(bg.y >> 8) & 15u] * sc);
+    out[11] = half(kMppE2M1[(bg.y >> 12) & 15u] * sc);
+    out[12] = half(kMppE2M1[(bg.y >> 16) & 15u] * sc);
+    out[13] = half(kMppE2M1[(bg.y >> 20) & 15u] * sc);
+    out[14] = half(kMppE2M1[(bg.y >> 24) & 15u] * sc);
+    out[15] = half(kMppE2M1[bg.y >> 28] * sc);
+}
+
 kernel void ink_mpp_sk_to_f16(
     device const uchar* W [[buffer(0)]],
     device half* dst      [[buffer(1)]],

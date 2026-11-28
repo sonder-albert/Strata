@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <numeric>
 #include <random>
 #include <sstream>
@@ -390,6 +391,11 @@ static bool run_parallel_bench(InkMetalRunner& r, int c_req, int prompt_len, int
 
     // 2. Coalesced c_req-slot decode steps (all c_req slots in ONE 48-visit Metal command buffer per step!)
     double td0 = mtl::now_s();
+    // INK_PAR_RANDOM=1: per-slot decorrelated token streams (xorshift on the real next_toks would
+    // also decorrelate after step 1, but prompts above make every slot's early decode identical -
+    // identical hidden states route to identical experts, which understates MoE scatter traffic
+    // for real multi-tenant workloads). A fixed random schedule models independent requests.
+    static const bool par_random = std::getenv("INK_PAR_RANDOM") != nullptr;
     for (int step = 0; step < gen_steps; ++step) {
         InkBatchStep st;
         st.M = c_req;
@@ -399,6 +405,11 @@ static bool run_parallel_bench(InkMetalRunner& r, int c_req, int prompt_len, int
         for (int s = 0; s < c_req; ++s) {
             st.slot_ids[s] = s;
             st.pos[s] = prompt_len + step;
+            if (par_random) {
+                uint32_t h = (uint32_t)(s * 2654435761u + step * 40503u + 1u);
+                h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+                st.tok_ids[s] = 100 + (int)(h % 199000u);
+            }
         }
         st.compute_logits = true;
         if (!r.forward_batch(st, nullptr, next_toks.data(), err)) return false;
@@ -427,7 +438,13 @@ int main(int argc, char** argv) {
     bool do_bench = false;
     bool do_par_sweep = false;
     bool do_warm = true;
+    int agree_n = 0;
+    float ee_tau = 0.0f;
+    bool do_topk_check = false;
+    bool do_lin_sf4_check = false;
     std::vector<int32_t> custom_ids;
+    std::string tap_collect_path;   // file with space/comma-separated token id sequences (blank line = boundary)
+    std::string tap_meta_path;      // sidecar: seq boundaries (offset/rows) for the INK_TAPDUMP stream
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -455,8 +472,14 @@ int main(int argc, char** argv) {
         else if (a == "--spec-check") do_spec_check = true;
         else if (a == "--bench") do_bench = true;
         else if (a == "--par-sweep") { do_par_sweep = true; if (max_slots < 64) max_slots = 64; }
+        else if (a == "--agree") agree_n = atoi(nxt().c_str());
+        else if (a == "--ee") ee_tau = (float)atof(nxt().c_str());
+        else if (a == "--topk-check") do_topk_check = true;
+        else if (a == "--lin-sf4-check") do_lin_sf4_check = true;
         else if (a == "--no-warm") do_warm = false;
         else if (a == "--dump-logits") dump_logits_path = nxt();
+        else if (a == "--tap-collect") tap_collect_path = nxt();
+        else if (a == "--tap-meta") tap_meta_path = nxt();
         else if (a == "--ids") {
             std::stringstream ss(nxt());
             std::string tok;
@@ -491,6 +514,141 @@ int main(int argc, char** argv) {
     if (!runner.init(cx, mod, max_slots, max_ctx, max_batch, want_dspark, vision_path, kernel_dir, err)) {
         fprintf(stderr, "[ERROR] runner init: %s\n", err.c_str());
         return 1;
+    }
+
+    if (do_lin_sf4_check) {
+        // SF4 (NVFP4) dense-linear kernel check on a synthetic tensor: pack N x K random
+        // weights into the canonical SF4 body on the host, run the real push_linear
+        // dispatch on GPU, compare against a double-precision host reference.
+        auto f32_to_e4m3_pos = [](float v) -> uint8_t {
+            if (v <= 0.0f) return 0;
+            if (v >= 448.0f) return 0x7E;
+            if (v < (1.0f / 64.0f)) return (uint8_t)std::max(0, std::min(7, (int)std::lround(v * 512.0f)));
+            int exp = 0;
+            float frac = std::frexp(v, &exp);
+            int e_bits = (exp - 1) + 7;
+            if (e_bits <= 0) return (uint8_t)std::max(0, std::min(7, (int)std::lround(v * 512.0f)));
+            int m = (int)std::lround((frac * 2.0f - 1.0f) * 8.0f);
+            if (m >= 8) { m = 0; ++e_bits; }
+            if (e_bits >= 15) return (e_bits == 15 && m <= 6) ? (uint8_t)((15 << 3) | m) : (uint8_t)0x7E;
+            return (uint8_t)((e_bits << 3) | (m & 7));
+        };
+        auto e4m3_pos_to_f32 = [](uint8_t b) -> float {
+            b &= 0x7F;
+            int e = (b >> 3) & 0xF, m = b & 7;
+            if (e == 0) return (float)m * (1.0f / 512.0f);
+            return std::ldexp(1.0f + (float)m * 0.125f, e - 7);
+        };
+        auto f32_to_e2m1_nib = [](float v) -> uint8_t {
+            uint8_t sign = (v < 0.0f) ? 8u : 0u;
+            float a = std::fabs(v);
+            uint8_t mag = 0u;
+            if      (a < 0.25f) mag = 0u;
+            else if (a < 0.75f) mag = 1u;
+            else if (a < 1.25f) mag = 2u;
+            else if (a < 1.75f) mag = 3u;
+            else if (a < 2.50f) mag = 4u;
+            else if (a < 3.50f) mag = 5u;
+            else if (a < 5.00f) mag = 6u;
+            else                mag = 7u;
+            return (uint8_t)(sign | mag);
+        };
+        static const float kE2M1_h[16] = {
+            0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+           -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
+        };
+        auto e4m3_lut_full = [](uint8_t c) -> float {
+            if ((c & 0x7F) == 0x7F) return 0.0f;
+            int e = (c >> 3) & 0xF, m = c & 7;
+            float v = (e == 0) ? (float)m * (1.0f / 512.0f)
+                               : std::ldexp(1.0f + (float)m * 0.125f, e - 7);
+            return (c & 0x80) ? -v : v;
+        };
+
+        std::mt19937 rng(20261128);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        int fails = 0;
+        for (int M : {1, 2, 4, 8, 12}) {
+            const int N = 129, K = 1152;
+            const float outer = 0.02083f;
+            const size_t codes_b = (size_t)N * (K / 2), scales_b = (size_t)N * (K / 16);
+            std::vector<uint8_t> body(16 + codes_b + scales_b, 0);
+            float* hdr = (float*)body.data();
+            hdr[0] = outer; hdr[1] = 1.0f; hdr[2] = 0.0f; hdr[3] = 0.0f;
+            uint8_t* pcodes = body.data() + 16;
+            uint8_t* pscales = pcodes + codes_b;
+            std::vector<float> x((size_t)M * K), wrow(K);
+            for (auto& v : x) v = nd(rng);
+            std::vector<double> ref((size_t)M * N, 0.0);
+            for (int r = 0; r < N; ++r) {
+                for (auto& v : wrow) v = nd(rng) * (float)outer;
+                uint8_t* dp = pcodes + (size_t)r * (K / 2);
+                uint8_t* ds = pscales + (size_t)r * (K / 16);
+                const int nblk = K / 16;
+                for (int b = 0; b < nblk; ++b) {
+                    const float* xr = wrow.data() + b * 16;
+                    float am = 0.0f;
+                    for (int i = 0; i < 16; ++i) am = std::max(am, std::fabs(xr[i]));
+                    uint8_t sb = f32_to_e4m3_pos((am / 6.0f) / outer);
+                    ds[b] = sb;
+                    const float sc = e4m3_pos_to_f32(sb) * outer;
+                    const float inv = (sc > 0.0f) ? (1.0f / sc) : 0.0f;
+                    for (int i = 0; i < 8; ++i) {
+                        uint8_t lo = f32_to_e2m1_nib(xr[2 * i + 0] * inv);
+                        uint8_t hi = f32_to_e2m1_nib(xr[2 * i + 1] * inv);
+                        dp[b * 8 + i] = (uint8_t)((lo & 0xF) | ((hi & 0xF) << 4));
+                    }
+                }
+                // host reference: exact dequant dot in double
+                for (int i = 0; i < M; ++i) {
+                    double acc = 0.0;
+                    for (int b = 0; b < nblk; ++b) {
+                        const float sc = e4m3_lut_full(ds[b]) * outer;
+                        for (int j = 0; j < 8; ++j) {
+                            const uint8_t pk = dp[b * 8 + j];
+                            acc += (double)sc * kE2M1_h[pk & 0xF] * x[(size_t)i * K + b * 16 + 2 * j];
+                            acc += (double)sc * kE2M1_h[pk >> 4] * x[(size_t)i * K + b * 16 + 2 * j + 1];
+                        }
+                    }
+                    ref[(size_t)i * N + r] = acc;
+                }
+            }
+            mtl::Buffer wb = cx.alloc((body.size() + 4095) & ~(size_t)4095);
+            std::memcpy(wb.ptr, body.data(), body.size());
+            mtl::Buffer xb = cx.alloc(x.size() * 4);
+            std::memcpy(xb.ptr, x.data(), x.size() * 4);
+            mtl::Buffer yb = cx.alloc((size_t)M * N * 4);
+            std::memset(yb.ptr, 0, (size_t)M * N * 4);
+
+            InkTensorInfo ti;
+            ti.name = "synth.sf4";
+            ti.fmt = FMT_SF4;
+            ti.shape = {N, K};
+            ti.bytes = body.size();
+            std::vector<mtl::Dispatch> ds;
+            runner.push_linear(ds, ti, mtl::Arg::B(wb), mtl::Arg::B(xb), mtl::Arg::B(yb), N, K, M);
+            cx.run_graph(ds);
+
+            const float* yg = (const float*)yb.ptr;
+            double max_abs = 0.0, max_rel = 0.0;
+            int bad = 0;
+            for (int i = 0; i < M; ++i) {
+                for (int r = 0; r < N; ++r) {
+                    const double e = ref[(size_t)i * N + r];
+                    const double d = std::fabs((double)yg[(size_t)i * N + r] - e);
+                    const double rl = d / std::max(1e-6, std::fabs(e));
+                    max_abs = std::max(max_abs, d);
+                    max_rel = std::max(max_rel, rl);
+                    if (d > 1e-2 && rl > 1e-2) ++bad;
+                }
+            }
+            printf("[SF4-CHECK] M=%d N=%d K=%d kernel=%s max_abs=%.3e max_rel=%.3e bad=%d %s\n",
+                   M, N, K, (M == 1 ? "mv1" : "mv"), max_abs, max_rel, bad, bad ? "FAIL" : "OK");
+            if (bad) fails += bad;
+            cx.free(wb); cx.free(xb); cx.free(yb);
+        }
+        if (fails) { fprintf(stderr, "[SF4-CHECK] FAILED: %d mismatched outputs\n", fails); return 1; }
+        printf("[SF4-CHECK] PASS: all kernel outputs match host dequant reference\n");
     }
 
     // Optional Vision test
@@ -611,6 +769,255 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+    }
+
+    if (agree_n > 0) {
+        // LoopSpec (arXiv 2609.17184) feasibility: how well do EARLY loop-pass argmaxes
+        // predict the final pass-3 token stream? Teacher-forced replay: feed the
+        // prompt + reference stream, take per-row argmax at pass=1,2,3, compare.
+        // Pass-3 agreement doubles as a batched-M-vs-M1 numeric divergence probe
+        // (the host-verify corruption suspect).
+        std::vector<int32_t> ref_ids;
+        double pm = 0, dm = 0; int acc = 0, off = 0;
+        runner.pass_override = 0;
+        if (!run_greedy_decode(runner, 0, custom_ids, agree_n, false, ref_ids, pm, dm, acc, off, err, 0)) {
+            fprintf(stderr, "[ERROR] agree ref decode: %s\n", err.c_str());
+            return 1;
+        }
+        // stream = prompt + reference continuation
+        std::vector<int32_t> stream = custom_ids;
+        stream.insert(stream.end(), ref_ids.begin(), ref_ids.end());
+        const int P = (int)custom_ids.size();
+        const int S = (int)stream.size();
+        // INK_AGREE_DUMP=<dir>: raw int32 dumps (stream.bin, argmax_p{1..3}.bin) for offline analysis
+        if (const char* dd = std::getenv("INK_AGREE_DUMP")) {
+            std::string fp = std::string(dd) + "/stream.bin";
+            FILE* f = std::fopen(fp.c_str(), "wb");
+            if (f) { std::fwrite(stream.data(), sizeof(int32_t), stream.size(), f); std::fclose(f); }
+        }
+
+        std::map<int, std::vector<int32_t>> am;   // passes -> argmax[row]
+        std::map<int, std::vector<float>>  pb;    // passes -> top-1 softmax prob[row]
+        double tf_ms[4] = {0, 0, 0, 0};
+        for (int p = 1; p <= mod.man.c.num_passes; ++p) {
+            runner.pass_override = p;
+            runner.reset_slot(0);
+            std::vector<int32_t> ar(S);
+            std::vector<float> pr(S);
+            double t0 = mtl::now_s();
+            for (int base = 0; base < S; base += 64) {
+                const int m = std::min(64, S - base);
+                InkBatchStep st;
+                st.M = m;
+                st.slot_ids.assign(m, 0);
+                st.pos.resize(m);
+                st.tok_ids.resize(m);
+                st.logits_rows.resize(m);
+                for (int i = 0; i < m; ++i) {
+                    st.pos[i] = base + i;
+                    st.tok_ids[i] = stream[base + i];
+                    st.logits_rows[i] = i;
+                }
+                st.compute_logits = true;
+                if (!runner.forward_batch(st, nullptr, ar.data() + base, err, pr.data() + base)) {
+                    fprintf(stderr, "[ERROR] agree forward p=%d: %s\n", p, err.c_str());
+                    return 1;
+                }
+            }
+            tf_ms[p] = (mtl::now_s() - t0) * 1e3;
+            am[p] = std::move(ar);
+            pb[p] = std::move(pr);
+            if (const char* dd = std::getenv("INK_AGREE_DUMP")) {
+                std::string fp = std::string(dd) + "/argmax_p" + std::to_string(p) + ".bin";
+                FILE* f = std::fopen(fp.c_str(), "wb");
+                if (f) { std::fwrite(am[p].data(), sizeof(int32_t), am[p].size(), f); std::fclose(f); }
+                fp = std::string(dd) + "/prob_p" + std::to_string(p) + ".bin";
+                f = std::fopen(fp.c_str(), "wb");
+                if (f) { std::fwrite(pb[p].data(), sizeof(float), pb[p].size(), f); std::fclose(f); }
+            }
+        }
+        // Metrics over generated rows: argmax at stream row i predicts stream[i+1].
+        printf("[AGREE] prompt=%d gen=%d ref_decode=%.1f ms | tf_fwd_ms p1=%.0f p2=%.0f p3=%.0f\n",
+               P, agree_n, dm, tf_ms[1], tf_ms[2], tf_ms[3]);
+        int hist[4][16] = {};
+        for (int p = 1; p <= mod.man.c.num_passes; ++p) {
+            int hit_stream = 0, hit_p3 = 0, n = 0;
+            for (int i = P - 1; i < S - 1; ++i) {
+                const int32_t gold = stream[i + 1];
+                int pos_in_win = i - (P - 1);
+                if (pos_in_win < 16) hist[p][pos_in_win] += (am[p][i] == gold) ? 1 : 0;
+                ++n;
+                if (am[p][i] == gold) ++hit_stream;
+                if (am[p][i] == am[3][i]) ++hit_p3;
+            }
+            // accepted-run length: longest prefix of consecutive stream hits from row P-1
+            int run = 0;
+            for (int i = P - 1; i < S - 1 && am[p][i] == stream[i + 1]; ++i) ++run;
+            printf("  pass=%d vs-ref %.3f  vs-pass3 %.3f  (n=%d) first_run=%d\n",
+                   p, (double)hit_stream / n, (double)hit_p3 / n, n, run);
+        }
+        // pass-3 batched argmax should equal greedy-decoded ref tokens ~1.000;
+        // a gap here reproduces host-verify-style divergence.
+    }
+
+    if (ee_tau > 0.0f) {
+        // Early-exit fidelity + speed check: greedy reference (tau=0) vs the same
+        // stream decoded with early exits at top-1-prob >= tau.
+        std::vector<int32_t> ref_ids, ee_ids;
+        double pm0 = 0, dm0 = 0, pm1 = 0, dm1 = 0;
+        int acc = 0, off = 0;
+        runner.early_exit_tau = 0.0f;
+        if (!run_greedy_decode(runner, 0, custom_ids, gen_n, false, ref_ids, pm0, dm0, acc, off, err, 0)) {
+            fprintf(stderr, "[ERROR] ee ref decode: %s\n", err.c_str());
+            return 1;
+        }
+        runner.early_exit_tau = ee_tau;
+        const long f0 = runner.ee_fired, t0n = runner.ee_total, p0 = runner.ee_passes_run;
+        if (!run_greedy_decode(runner, 0, custom_ids, gen_n, false, ee_ids, pm1, dm1, acc, off, err, 0)) {
+            fprintf(stderr, "[ERROR] ee decode: %s\n", err.c_str());
+            return 1;
+        }
+        int match = 0;
+        const int ncmp = (int)std::min(ref_ids.size(), ee_ids.size());
+        for (int i = 0; i < ncmp; ++i) { if (ref_ids[i] == ee_ids[i]) ++match; else break; }
+        const long ef = runner.ee_fired - f0, et = runner.ee_total - t0n, ep = runner.ee_passes_run - p0;
+        printf("[EE tau=%.2f] parity=%d/%d (%s) | ref=%.1f tok/s ee=%.1f tok/s | exits=%ld/%ld (%.1f%%) passes=%ld/%ld\n",
+               ee_tau, match, ncmp, (match == ncmp && ref_ids.size() == ee_ids.size()) ? "EXACT" : "DIFF",
+               ref_ids.size() / std::max(dm0 * 1e-3, 1e-6),
+               ee_ids.size() / std::max(dm1 * 1e-3, 1e-6),
+               ef, et, 100.0 * ef / std::max<long>(et, 1), ep, et * 3);
+        if (match != ncmp) printf("  first diff @%d: ref=%d ee=%d\n", match, ref_ids[match], ee_ids[match]);
+        runner.early_exit_tau = 0.0f;
+    }
+
+    if (do_topk_check) {
+        // Fused unembed+topk parity: same 8-row batch through (a) full logits + argmax and
+        // (b) want_topk -> bd_fk_out first key. Reproduces the "token id -1" verify bug.
+        const int R = 8;
+        runner.reset_slot(0);
+        const int P = (int)custom_ids.size();
+        // feed prompt, then R rows: prompt tail + first ref tokens so rows are real context
+        {
+            InkBatchStep st;
+            st.M = P;
+            st.slot_ids.assign(P, 0);
+            st.pos.resize(P);
+            st.tok_ids = custom_ids;
+            for (int i = 0; i < P; ++i) st.pos[i] = i;
+            st.compute_logits = false;
+            if (!runner.forward_batch(st, nullptr, nullptr, err)) { fprintf(stderr, "[ERR] %s\n", err.c_str()); return 1; }
+        }
+        auto run_rows = [&](bool topk, std::vector<int32_t>& out, int32_t feed) {
+            InkBatchStep st;
+            st.M = R;
+            st.slot_ids.assign(R, 0);
+            st.pos.resize(R);
+            st.tok_ids.assign(R, feed);
+            for (int i = 0; i < R; ++i) st.pos[i] = P + i;
+            st.compute_logits = true;
+            st.want_topk = topk;
+            if (topk) {
+                if (!runner.forward_batch(st, nullptr, nullptr, err)) return false;
+                const uint64_t* keys = (const uint64_t*)runner.bd_fk_out.ptr;
+                out.resize(R);
+                for (int r = 0; r < R; ++r)
+                    out[r] = (int32_t)(0xFFFFFFFFu - (uint32_t)(keys[(size_t)r * 128] & 0xFFFFFFFFull));
+            } else {
+                out.assign(R, -2);
+                return runner.forward_batch(st, nullptr, out.data(), err);
+            }
+            return true;
+        };
+        std::vector<int32_t> full, fused;
+        if (!run_rows(false, full, 15496)) { fprintf(stderr, "[ERR full] %s\n", err.c_str()); return 1; }
+        // restore context: the full pass already wrote these rows' states; topk run overwrites same positions
+        if (!run_rows(true, fused, 15496)) { fprintf(stderr, "[ERR fused] %s\n", err.c_str()); return 1; }
+        // pipeline probes: which stage produced keys?
+        {
+            const uint64_t* pt = (const uint64_t*)runner.bd_tk_part.ptr;
+            const uint64_t* fa = (const uint64_t*)runner.bd_fk_a.ptr;
+            const uint64_t* fb = (const uint64_t*)runner.bd_fk_b.ptr;
+            auto nz = [](const uint64_t* p, int n) { int c = 0; for (int i = 0; i < n; ++i) if (p[i]) ++c; return c; };
+            // row0 level-1 output should live in fk_a[0 .. 196*128); level-2 in fk_b[0 .. 13*128)
+            printf("[TOPK-PROBE] tk_part nz=%d/1024 | fk_a nz=%d/25088 fk_b nz=%d/25088 | pt0=%016lx fa0=%016lx fa[128]=%016lx fb0=%016lx\n",
+                   nz(pt, 1024), nz(fa, 25088), nz(fb, 25088),
+                   (unsigned long)pt[0], (unsigned long)fa[0], (unsigned long)fa[128], (unsigned long)fb[0]);
+            const uint64_t* fo = (const uint64_t*)runner.bd_fk_out.ptr;
+            for (int r = 0; r < 8; ++r)
+                printf("  fk_out row%d key0=%016lx -> tok %d\n", r, (unsigned long)fo[(size_t)r*128],
+                       (int32_t)(0xFFFFFFFFu - (uint32_t)(fo[(size_t)r*128] & 0xFFFFFFFFull)));
+            // first nonzero group per row in fk_a (row stride = 196 groups x 128)
+            for (int r = 0; r < 8; ++r) {
+                int first_g = -1, last_g = -1, z = 0;
+                for (int g = 0; g < 196; ++g) {
+                    bool any = false;
+                    for (int i = 0; i < 128; ++i) if (fa[(size_t)r * 196 * 128 + (size_t)g * 128 + i]) { any = true; break; }
+                    if (any) { if (first_g < 0) first_g = g; last_g = g; } else ++z;
+                }
+                printf("  fk_a row%d: first_nz_g=%d last_nz_g=%d zero_groups=%d\n", r, first_g, last_g, z);
+            }
+            // and fk_b (13 groups/row)
+            for (int r = 0; r < 8; ++r) {
+                int first_g = -1, z = 0;
+                for (int g = 0; g < 13; ++g) {
+                    bool any = false;
+                    for (int i = 0; i < 128; ++i) if (fb[(size_t)r * 13 * 128 + (size_t)g * 128 + i]) { any = true; break; }
+                    if (any) { if (first_g < 0) first_g = g; } else ++z;
+                }
+                printf("  fk_b row%d: first_nz_g=%d zero_groups=%d\n", r, first_g, z);
+            }
+        }
+        printf("[TOPK-CHECK] rows=%d\n", R);
+        int bad = 0;
+        for (int r = 0; r < R; ++r) {
+            const char* tag = (full[r] == fused[r]) ? "ok" : "DIFF";
+            if (full[r] != fused[r]) ++bad;
+            printf("  row%d full=%d fused=%d %s\n", r, full[r], fused[r], tag);
+        }
+        printf("[TOPK-CHECK] %d/%d mismatched\n", bad, R);
+    }
+
+    if (!tap_collect_path.empty()) {
+        // On-policy distill-tap collection: for each sequence in the file, run a plain
+        // greedy decode (no spec) so every position's b_cur/b_h_norm snapshot lands in
+        // the INK_TAPDUMP stream (int32 pos + int32 tok + 4*D fp32 per row). The sidecar
+        // meta file records per-sequence row counts so the consumer can slice the stream
+        // without sentinels: "seq <idx> <n_rows> <prompt_len> <gen_len>\n".
+        std::ifstream in(tap_collect_path);
+        if (!in) { fprintf(stderr, "[ERROR] cannot open %s\n", tap_collect_path.c_str()); return 1; }
+        FILE* mf = tap_meta_path.empty() ? nullptr : std::fopen(tap_meta_path.c_str(), "ab");
+        if (tap_meta_path.size() && !mf) { fprintf(stderr, "[ERROR] cannot open meta %s\n", tap_meta_path.c_str()); return 1; }
+        std::string line;
+        int si = 0;
+        double t_all = mtl::now_s();
+        while (std::getline(in, line)) {
+            for (char& ch : line) if (ch == ',') ch = ' ';
+            std::stringstream ls(line);
+            std::vector<int32_t> seq;
+            int64_t v;
+            while (ls >> v) seq.push_back((int32_t)v);
+            if (seq.empty()) continue;
+            if ((int)seq.size() + gen_n + 2 > runner.max_ctx) {
+                fprintf(stderr, "[TAP] seq %d skipped: len=%zu > ctx\n", si, seq.size());
+                ++si; continue;
+            }
+            std::vector<int32_t> out_ids;
+            double pm = 0, dm = 0; int acc = 0, off = 0;
+            if (!run_greedy_decode(runner, 0, seq, gen_n, false, out_ids, pm, dm, acc, off, err, 0)) {
+                fprintf(stderr, "[ERROR] tap-collect seq %d: %s\n", si, err.c_str());
+                if (mf) std::fclose(mf);
+                return 1;
+            }
+            // The final generated token is appended without a forward (decode loop stops
+            // when out_ids reaches max_new), so the dump holds P + G - 1 rows.
+            const int rows = (int)seq.size() + (int)out_ids.size() - 1;
+            if (mf) std::fprintf(mf, "seq %d %d %d %d\n", si, rows, (int)seq.size(), (int)out_ids.size());
+            fprintf(stderr, "[TAP] seq %d: P=%d G=%d (%.1f ms prefill, %.1f ms decode)\n",
+                    si, (int)seq.size(), (int)out_ids.size(), pm, dm);
+            ++si;
+        }
+        if (mf) std::fclose(mf);
+        fprintf(stderr, "[TAP] done: %d seqs in %.1f s\n", si, mtl::now_s() - t_all);
     }
 
     return 0;

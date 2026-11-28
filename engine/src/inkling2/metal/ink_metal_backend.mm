@@ -250,6 +250,10 @@ public:
         const auto& c = mod_.man.c;
         const size_t row = (size_t)c.n_kv * (size_t)c.head_dim;
         runner_.restore_slot(slot, ck.sconv);
+        // The target is back at the prompt boundary. Rebuild the external
+        // drafter from the retained target rows before asking for candidates.
+        auto history = runner_.feature_history.find(slot);
+        if (history != runner_.feature_history.end()) history->second.sent = -1;
         for (int v = 0; v < c.n_visits; ++v) {
             if (ck.swa_k[v].empty()) continue;
             const size_t stride = (size_t)runner_.visit_kv_stride[v];
@@ -276,12 +280,33 @@ public:
 
     bool forward_batch(const StepBatch& batch, float* logits_out, TapCapture* taps_out, std::string& err) override {
         if (batch.n_tokens <= 0) return true;
+        static const bool prof_on = std::getenv("STRATA_INK_PROF") != nullptr;
+        const double prof_t0 = prof_on ? mtl::now_s() : 0.0;
         // Auto-slice oversized multi-slot prefill batches (e.g. --bench --parallel 64 --prompt-len 64 -> M=4096)
-        if (batch.n_tokens > runner_.max_batch) {
+        // Auto-slice oversized batches or batches whose per-slot span would wrap the SWA KV ring (upstream #7098)
+        int slice_cap = runner_.max_batch;
+        if (runner_.swa_span_cap > 0 && batch.n_tokens > runner_.swa_span_cap) {
+            std::unordered_map<int, std::pair<int, int>> slot_span;
+            for (int i = 0; i < batch.n_tokens; ++i) {
+                const int s = batch.slot_ids[i];
+                const int p = batch.pos[i];
+                auto it = slot_span.find(s);
+                if (it == slot_span.end()) slot_span.emplace(s, std::make_pair(p, p));
+                else { it->second.first = std::min(it->second.first, p); it->second.second = std::max(it->second.second, p); }
+            }
+            for (const auto& kv : slot_span) {
+                const int lo = kv.second.first, hi = kv.second.second;
+                if (hi >= runner_.swa_ring && (hi - lo + 1) > runner_.swa_span_cap) {
+                    slice_cap = std::min(slice_cap, runner_.swa_span_cap);
+                    break;
+                }
+            }
+        }
+        if (batch.n_tokens > slice_cap) {
             const int V = mod_.man.c.vocab_unpadded;
             int out_row = 0;
-            for (int off = 0; off < batch.n_tokens; off += runner_.max_batch) {
-                const int take = std::min(runner_.max_batch, batch.n_tokens - off);
+            for (int off = 0; off < batch.n_tokens; off += slice_cap) {
+                const int take = std::min(slice_cap, batch.n_tokens - off);
                 StepBatch sub;
                 sub.capture_taps = batch.capture_taps;
                 sub.img_embeds = batch.img_embeds;
@@ -339,10 +364,12 @@ public:
                     if (batch.want_logits[m]) { st.logits_last_only_idx = m; break; }
                 }
                 if (!runner_.forward_batch(st, logits_out, nullptr, err)) return false;
-            } else if (st.M > 64) {
+            } else if (st.M > 64 || n_want < st.M) {
                 // The runner computes the unembed for the FIRST min(M, 64) rows of the batch. With several requests ending their
                 // prompt in one batch of more than 64 rows, the wanted rows lie further down and came back as zeros (greedy token 0):
                 // the more slots, the more of the first replies were wrong (0.2.21 GRID: 9 of 32 clients at --parallel 32).
+                // Same gather for verify batches: M draft tokens of one slot want every row anyway (n_want == M),
+                // but merged continuous-batch steps often carry rows that need no logits - unembed those rows never.
                 if (n_want > 64) { err = "metal: more than 64 logits rows in one batch"; return false; }
                 st.logits_last_only_idx = -1;
                 for (int m = 0; m < st.M; ++m) if (batch.want_logits[m]) st.logits_rows.push_back(m);
@@ -366,6 +393,170 @@ public:
             if (!runner_.forward_batch(st, nullptr, nullptr, err)) return false;
         }
         (void)taps_out;
+        if (prof_on) {
+            static double s_wall[9] = {}, s_gpu[9] = {}; static long s_n[9] = {};
+            const int mi = st.M < 1 ? 1 : (st.M > 8 ? 8 : st.M);
+            s_wall[mi] += (mtl::now_s() - prof_t0) * 1e3;
+            s_gpu[mi] += runner_.last_gpu_ms;
+            ++s_n[mi];
+            static long total = 0;
+            if (++total % 32 == 0) {
+                std::string line;
+                for (int m = 1; m <= 8; ++m) {
+                    if (!s_n[m]) continue;
+                    char buf[160];
+                    std::snprintf(buf, sizeof buf, "M%d(n=%ld wall=%.2fms gpu=%.2fms host=%.2fms) ",
+                                  m, s_n[m], s_wall[m] / s_n[m], s_gpu[m] / s_n[m], (s_wall[m] - s_gpu[m]) / s_n[m]);
+                    line += buf;
+                }
+                std::fprintf(stderr, "[ink PROF fwd] %s\n", line.c_str());
+            }
+        }
+        return true;
+    }
+
+    bool supports_candidates() const noexcept override { return true; }
+
+    bool supports_greedy_argmax() const noexcept override { return true; }
+
+    // Greedy verify rows: the fused unembed+argmax kernel never materializes logits at all -
+    // no b_logits write, no softcap sweep, no host memcpy. One pass over the unembed weight, 4 bytes per row back.
+    bool forward_batch_argmax(const StepBatch& batch, std::vector<int32_t>& out_ids, std::string& err) override {
+        const int nrows = batch.count_logits();
+        if (nrows <= 0) { out_ids.clear(); return true; }
+        if (batch.n_tokens > runner_.max_batch) {
+            err = "metal: greedy argmax rows do not slice yet";
+            return false;
+        }
+        ink_metal::InkBatchStep st;
+        st.M = batch.n_tokens;
+        st.slot_ids = batch.slot_ids;
+        st.pos = batch.pos;
+        st.tok_ids = batch.token_ids;
+        st.capture_taps = batch.capture_taps;
+        const int D = mod_.man.c.hidden;
+        bool any_img = false;
+        for (int idx : batch.img_embed_idx) if (idx >= 0) { any_img = true; break; }
+        if (any_img && batch.img_embeds) {
+            st.is_img.assign((size_t)st.M, 0);
+            st.img_embeds.assign((size_t)st.M * D, 0.0f);
+            for (int m = 0; m < st.M; ++m) {
+                if (batch.img_embed_idx[m] >= 0) {
+                    st.is_img[m] = 1;
+                    std::memcpy(st.img_embeds.data() + (size_t)m * D,
+                                batch.img_embeds + (size_t)batch.img_embed_idx[m] * D,
+                                (size_t)D * sizeof(float));
+                }
+            }
+        }
+        st.compute_logits = true;
+        if (nrows == 1) {
+            for (int m = 0; m < st.M; ++m) {
+                if (batch.want_logits[m]) { st.logits_last_only_idx = m; break; }
+            }
+        } else {
+            st.logits_last_only_idx = -1;
+            if (nrows < st.M) {
+                for (int m = 0; m < st.M; ++m) if (batch.want_logits[m]) st.logits_rows.push_back(m);
+            }
+        }
+        // fused unembed+topk for 5..16 rows (mm8-identical GEMM, logits never materialized);
+        // the argmax of a row is its first candidate key. smaller row counts keep the fused mv+argmax route.
+        const auto& uti = mod_.man.get("model.llm.unembed.weight");
+        const bool fused = nrows >= 5 && nrows <= 16 && uti.fmt == ink_metal::FMT_S6;
+        st.want_topk = fused;
+        out_ids.assign((size_t)nrows, 0);
+        if (!runner_.forward_batch(st, nullptr, fused ? nullptr : out_ids.data(), err)) return false;
+        if (fused) {
+            const uint64_t* keys = (const uint64_t*)runner_.bd_fk_out.ptr;
+            for (int r = 0; r < nrows; ++r) {
+                const uint64_t key = keys[(size_t)r * 128];
+                out_ids[(size_t)r] = (int32_t)(0xFFFFFFFFu - (uint32_t)(key & 0xFFFFFFFFull));
+            }
+        }
+        return true;
+    }
+
+    // Exact top-128 candidate rows (#6779 metal port): the step computes logits into the runner's
+    // internal unified-memory buffer WITHOUT the host memcpy of full rows, then the GPU bitonic
+    // top-k passes extract the 128 best (id, logit) pairs per wanted row - 1KB per row instead of 800KB.
+    bool forward_batch_cand(const StepBatch& batch, CandRows& out, std::string& err) override {
+        const int nrows = batch.count_logits();
+        if (nrows <= 0) { out.rows = 0; out.k = 0; return true; }
+        if (batch.n_tokens > runner_.max_batch) {
+            // slicing candidate batches is not wired yet: leave this step on the full-row path
+            out.rows = 0;
+            err = "metal: candidate rows do not slice yet";
+            return false;
+        }
+        if (!runner_.ensure_topk(nrows)) { err = "no memory for the candidate scratch"; return false; }
+
+        ink_metal::InkBatchStep st;
+        st.M = batch.n_tokens;
+        st.slot_ids = batch.slot_ids;
+        st.pos = batch.pos;
+        st.tok_ids = batch.token_ids;
+        st.capture_taps = batch.capture_taps;
+        const int D = mod_.man.c.hidden;
+        bool any_img = false;
+        for (int idx : batch.img_embed_idx) if (idx >= 0) { any_img = true; break; }
+        if (any_img && batch.img_embeds) {
+            st.is_img.assign((size_t)st.M, 0);
+            st.img_embeds.assign((size_t)st.M * D, 0.0f);
+            for (int m = 0; m < st.M; ++m) {
+                if (batch.img_embed_idx[m] >= 0) {
+                    st.is_img[m] = 1;
+                    std::memcpy(st.img_embeds.data() + (size_t)m * D,
+                                batch.img_embeds + (size_t)batch.img_embed_idx[m] * D,
+                                (size_t)D * sizeof(float));
+                }
+            }
+        }
+        // compute logits for wanted rows only, into the internal buffer; NO host copy of full rows.
+        st.compute_logits = true;
+        if (nrows == 1) {
+            for (int m = 0; m < st.M; ++m) {
+                if (batch.want_logits[m]) { st.logits_last_only_idx = m; break; }
+            }
+        } else {
+            st.logits_last_only_idx = -1;
+            if (nrows < st.M) {
+                for (int m = 0; m < st.M; ++m) if (batch.want_logits[m]) st.logits_rows.push_back(m);
+            }
+        }
+        const int V = mod_.man.c.vocab_unpadded;
+        // fused unembed+topk for 5..16 rows: mm8-identical GEMM with logits never materialized.
+        // fewer rows keep the legacy materialize+run_topk route (exactness of the mv baseline path).
+        static const bool no_fused = std::getenv("STRATA_INK_NO_FUSED_TOPK") != nullptr;
+        const auto& uti = mod_.man.get("model.llm.unembed.weight");
+        const bool fused = !no_fused && nrows >= 5 && nrows <= 16 && uti.fmt == ink_metal::FMT_S6;
+        st.want_topk = fused;
+        if (!runner_.forward_batch(st, nullptr, nullptr, err)) return false;
+        if (!fused) runner_.run_topk(nrows, V);
+
+        out.rows = nrows;
+        out.k = std::min(kInkCandidates, V);
+        out.val.assign((size_t)nrows * kInkCandidates, 0.0f);
+        out.idx.assign((size_t)nrows * kInkCandidates, 0);
+        out.finite.assign((size_t)nrows, 1);
+        const uint64_t* keys = (const uint64_t*)(fused ? runner_.bd_fk_out.ptr : runner_.bd_tk_out.ptr);
+        const int* fin = (const int*)runner_.bd_tk_fin.ptr;
+        const int kc = out.k;
+        for (int k = 0; k < nrows; ++k) {
+            const uint64_t* rkeys = keys + (size_t)k * kInkCandidates;
+            for (int j = 0; j < kc; ++j) {
+                const uint64_t key = rkeys[j];
+                int32_t id = (int32_t)(0xFFFFFFFFu - (uint32_t)(key & 0xFFFFFFFFull));
+                uint32_t b = (uint32_t)(key >> 32);
+                b ^= (b & 0x80000000u) ? 0x80000000u : 0xFFFFFFFFu;
+                float fv;
+                std::memcpy(&fv, &b, 4);
+                if (id < 0 || id >= V) id = 0;
+                out.val[(size_t)k * kInkCandidates + j] = fv;
+                out.idx[(size_t)k * kInkCandidates + j] = id;
+            }
+            out.finite[k] = fin[k] != 0 ? 1 : 0;
+        }
         return true;
     }
 
@@ -387,6 +578,56 @@ public:
         int32_t* out_emitted,
         int* out_drafted,
         std::string& err) override {
+        if (const char* fd_env = std::getenv("INK_DFLASH_FD")) {
+            // Single-slot text probe: send only newly committed feature rows.
+            const int fd = atoi(fd_env);
+            // Mixed batches interleave rows from both slots. Select only this slot's rows and require an unbroken position chain.
+            auto it=runner_.feature_history.find(slot);
+            if(it==runner_.feature_history.end()) return 0;
+            auto& history=it->second;
+            const bool reset=history.sent<0;
+            const int start=std::max({0,history.sent,anchor_pos-2047});
+            const int kept=anchor_pos-start;
+            // Generation can evict prompt features from the ring. Continue
+            // ordinary decoding until the whole draft window is available.
+            for (int pos = start; pos < anchor_pos; ++pos) {
+                if (history.positions[pos % history.capacity] != pos) return 0;
+            }
+            auto transfer = [&](void* data, size_t bytes, bool sending) {
+                char* cursor = static_cast<char*>(data);
+                while (bytes) {
+                    ssize_t n = sending ? write(fd,cursor,bytes) : read(fd,cursor,bytes);
+                    if (n <= 0) return false;
+                    cursor += n; bytes -= n;
+                }
+                return true;
+            };
+            int request[]={start,kept,int(anchor_tok),std::min(7,max_emit-1),slot,int(reset)};
+            if(kept<=0) return 0;
+            if(!transfer(request,sizeof(request),true)){err="draft IPC header";return -1;}
+            const int d=mod_.man.c.hidden;
+            for(int layer=0;layer<4;++layer) for(int pos=start;pos<anchor_pos;++pos) {
+                float* feature=history.rows.data()+((pos%history.capacity)*4+layer)*d;
+                if(!transfer(feature,d*sizeof(float),true)){err="draft IPC features";return -1;}
+            }
+            history.sent=anchor_pos;
+            const int proposed=request[3];
+            ink_metal::InkBatchStep st;
+            st.M=proposed+1; st.slot_ids.assign(st.M,slot); st.pos.resize(st.M); st.tok_ids.resize(st.M);
+            st.tok_ids[0]=anchor_tok;
+            if (!transfer(&st.tok_ids[1],proposed*sizeof(int32_t),false)) {err="draft IPC reply";return -1;}
+            for (int i=0;i<st.M;++i) st.pos[i]=anchor_pos+i;
+            st.compute_logits=true; st.record_verify_ring=true;
+            int32_t ids[8]{};
+            if (!runner_.forward_batch(st,nullptr,ids,err)) return -1;
+            int matched=0;
+            while (matched<proposed && ids[matched]==st.tok_ids[matched+1]) ++matched;
+            std::copy(ids,ids+matched+1,out_emitted);
+            if (matched<proposed) runner_.restore_verify_step(slot,matched);
+            last_ver_slot_=slot;last_ver_pos0_=anchor_pos;last_ver_m_=st.M;last_tree_slot_=-1;
+            if (out_drafted) *out_drafted=proposed;
+            return matched+1;
+        }
         if (!runner_.use_dspark || !runner_.use_dspark_meff || slot < 0 || slot >= runner_.max_slots ||
             max_emit < 2 || anchor_pos <= 0 || anchor_pos + 12 >= runner_.max_ctx) {
             return 0;
@@ -415,9 +656,23 @@ public:
         const double t_step0 = mtl::now_s();
         const bool is_bf16_trunk = (mod_.man.get("model.llm.layers.0.attn.wq_du.weight").fmt == ink_metal::FMT_BF16);
         const bool is_sq10 = (mod_.man.build.find("10") != std::string::npos);
-        const double t_plain_ms = runner_.is_apple10 ? (is_bf16_trunk ? 17.2 : (is_sq10 ? 13.5 : 14.8)) : 41.0;
+        // Calibrated on M6 24GB SQ-10 locked: plain M1 pass = 27.1ms (was 13.5 - half the truth,
+        // which doubled apparent speculative gain and kept drafting on content where it loses).
+        static const double t_plain_override = [] { const char* e = std::getenv("INK_TPLAIN"); return e ? atof(e) : -1.0; }();
+        const double t_plain_ms = (t_plain_override > 0) ? t_plain_override
+            : (runner_.is_apple10 ? (is_bf16_trunk ? 17.2 : (is_sq10 ? 27.1 : 14.8)) : 41.0);
 
         auto update_gain = [&](int n_emit) {
+            static const bool acc_log = std::getenv("INK_ACCLOG") != nullptr;
+            if (acc_log) {
+                static long hist[16] = {}, nlog = 0;
+                ++hist[std::min(15, n_emit)];
+                if (++nlog % 64 == 0) {
+                    std::fprintf(stderr, "[ink ACC] emit-len hist:");
+                    for (int i = 1; i <= 9; ++i) std::fprintf(stderr, " %d:%ld", i, hist[i]);
+                    std::fprintf(stderr, " (n=%ld)\n", nlog);
+                }
+            }
             const double step_ms = std::max(1.0, (mtl::now_s() - t_step0) * 1e3);
             const double step_gain = (double)n_emit * t_plain_ms / step_ms;
             slot_ema_gain_[slot] = 0.72 * slot_ema_gain_[slot] + 0.28 * step_gain;
@@ -432,7 +687,8 @@ public:
         };
 
         ink_metal::InkDraftTree tree;
-        const int max_b = (max_emit <= 4) ? std::min(10, max_emit + 2) : 10;
+        static const int max_b_override = [] { const char* e = std::getenv("INK_TREE_BUDGET"); return e ? atoi(e) : -1; }();
+        const int max_b = (max_b_override > 0) ? max_b_override : ((max_emit <= 4) ? std::min(10, max_emit + 2) : 10);
         const int dcap = std::max(4, std::min(slot_beam_depth_[slot], std::min(7, max_emit - 1)));
         const int tm = runner_.dspark_draft_beam_tree(slot, anchor_tok, anchor_pos, max_b, /*dynamic_bayes=*/true, tree, dcap);
         if (tm <= 1) return 0;

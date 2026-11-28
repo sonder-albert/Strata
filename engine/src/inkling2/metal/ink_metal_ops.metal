@@ -419,6 +419,22 @@ kernel void ink_add(
     if (int(gid) < N) out[gid] = a[gid] + b[gid];
 }
 
+
+// LoopCD-Hidden linear combination: out[i] = a[i] + w * (a[i] - b[i])
+// a = final-pass hidden (h_R in b_cur), b = first-pass hidden (h_1 in b_bank_out)
+kernel void ink_axpby_lcd(
+    device float* out      [[buffer(0)]],
+    device const float* a  [[buffer(1)]],
+    device const float* b  [[buffer(2)]],
+    constant float& w      [[buffer(3)]],
+    constant int& N        [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (int(gid) < N) {
+        float av = a[gid];
+        out[gid] = av + w * (av - b[gid]);
+    }
+}
+
 // Fast F32 copy: dst[i] = src[i]
 kernel void ink_copy_f32(
     device const float* src [[buffer(0)]],
@@ -705,7 +721,7 @@ kernel void ink_kv_norm_store_f16(
     const int m = int(tgp.x), kh = int(tgp.y);
     const int slot = slot_ids[m];
     const int pos = pos_buf[m];
-    const int kpos = is_swa ? (pos & 1023) : pos;
+    const int kpos = is_swa ? (pos % kv_stride) : pos;
 
     device const float* kp = k_in + ((size_t)m * INK_NKV + kh) * INK_HD;
     const float kv = kp[tid];
@@ -796,7 +812,7 @@ kernel void ink_relpos_sink_gqa(
     const size_t slot_kv_base = (size_t)slot * A.kv_stride;
 
     for (int k = k_start + int(sg); k < k_end; k += 4) {
-        const int kidx = A.is_swa ? (k & 1023) : k;
+        const int kidx = A.is_swa ? (k % A.kv_stride) : k;
         const size_t kv_off = ((slot_kv_base + kidx) * INK_NKV + kh) * INK_HD;
         const float4 kv = float4(((device const half4*)(k_cache + kv_off))[lane]);
         float sc = simd_sum(dot(qv, kv));
@@ -893,7 +909,7 @@ kernel void ink_relpos_gqa_splitk(
 
     const size_t slot_kv_base = (size_t)slot * A.kv_stride;
     for (int k = p_start + int(sg); k < p_end; k += 4) {
-        const int kidx = A.is_swa ? (k & 1023) : k;
+        const int kidx = A.is_swa ? (k % A.kv_stride) : k;
         const size_t kv_off = ((slot_kv_base + kidx) * INK_NKV + kh) * INK_HD;
         const float4 kv = float4(((device const half4*)(k_cache + kv_off))[lane]);
         const float4 vv = float4(((device const half4*)(v_cache + kv_off))[lane]);
@@ -1137,6 +1153,142 @@ kernel void ink_argmax_rows(
     if (tid == 0) out_ids[m] = sh_i[0];
 }
 
+// Deterministic first-max argmax + top-1 softmax probability (with softcap applied
+// inside the exponential, matching ink_softcap_f32 semantics). grid (M,1,1), 256 threads.
+kernel void ink_argmax_prob(
+    device const float* logits [[buffer(0)]],
+    device int* out_ids        [[buffer(1)]],
+    device float* out_prob     [[buffer(2)]],
+    constant int& V            [[buffer(3)]],
+    constant float& cap        [[buffer(4)]],
+    uint m   [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_v[256];
+    threadgroup int sh_i[256];
+    device const float* row = logits + (size_t)m * V;
+    float bv = -1e30f;
+    int bi = 0;
+    for (int i = int(tid); i < V; i += 256) {
+        const float v = row[i];
+        if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+    }
+    sh_v[tid] = bv; sh_i[tid] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            const float v1 = sh_v[tid + s];
+            const int i1 = sh_i[tid + s];
+            if (v1 > sh_v[tid] || (v1 == sh_v[tid] && i1 < sh_i[tid])) {
+                sh_v[tid] = v1; sh_i[tid] = i1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv = 1.0f / cap;
+    const float captop = cap * tanh(clamp(sh_v[0] * inv, -15.0f, 15.0f));
+    float ssum = 0.0f;
+    for (int i = int(tid); i < V; i += 256) {
+        const float z = cap * tanh(clamp(row[i] * inv, -15.0f, 15.0f));
+        ssum += exp(z - captop);
+    }
+    sh_v[tid] = ssum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sh_v[tid] += sh_v[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) { out_ids[m] = sh_i[0]; out_prob[m] = 1.0f / sh_v[0]; }
+}
+
+// ============================================================================
+// 9. Exact top-128 candidate extraction (port of CUDA ink_topk.cuh, #6779).
+//    key = (order-preserving 32-bit image of the logit) << 32 | (0xFFFFFFFF - id);
+//    largest key is the best candidate. NaN gets key 0 (rejected before sampling anyway).
+//    pass1: grid (128 slices, rows): bitonic-sort 2048 keys per slice, keep 128
+//    merge: groups of `m` sorted lists -> one sorted list of 128 per group
+// ============================================================================
+
+#define INK_TOPK_CAND 128
+#define INK_TOPK_SLICES 128
+#define INK_TOPK_SORTN 2048
+#define INK_TOPK_THREADS 256
+
+static inline ulong ink_topk_key(float v, int idx) {
+    if (v != v) return 0ul;
+    if (v == 0.0f) v = as_type<float>(0u);
+    uint b = as_type<uint>(v);
+    b ^= (b & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u;
+    return ((ulong)b << 32) | (ulong)(0xFFFFFFFFu - (uint)idx);
+}
+
+// bitonic sort of INK_TOPK_SORTN keys in threadgroup memory, largest first
+static inline void ink_topk_sort2048(threadgroup ulong* a, uint tid) {
+    for (int k = 2; k <= INK_TOPK_SORTN; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (uint i = tid; i < INK_TOPK_SORTN; i += INK_TOPK_THREADS) {
+                const uint ixj = i ^ (uint)j;
+                if (ixj > i) {
+                    const ulong x = a[i], y = a[ixj];
+                    const bool desc = ((i & (uint)k) == 0u);
+                    if (desc ? (x < y) : (x > y)) { a[i] = y; a[ixj] = x; }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+kernel void ink_topk_pass1(
+    device const float* logits [[buffer(0)]],
+    device ulong* out          [[buffer(1)]],
+    device int* fin            [[buffer(2)]],
+    constant int& V            [[buffer(3)]],
+    uint2 tg2  [[threadgroup_position_in_grid]],
+    uint tid   [[thread_index_in_threadgroup]]) {
+    const uint slice = tg2.x, row = tg2.y;
+    threadgroup ulong s_key[INK_TOPK_SORTN];
+    const int S = (V + INK_TOPK_SLICES - 1) / INK_TOPK_SLICES;
+    const int base = int(slice) * S;
+    device const float* r = logits + (size_t)row * V;
+    int bad = 0;
+    for (uint i = tid; i < INK_TOPK_SORTN; i += INK_TOPK_THREADS) {
+        const int g = base + int(i);
+        ulong key = 0ul;
+        if (int(i) < S && g < V) {
+            const float v = r[g];
+            key = ink_topk_key(v, g);
+            if (g % 67 == 0 && !(v == v && abs(v) != INFINITY)) bad = 1;
+        }
+        s_key[i] = key;
+    }
+    if (bad) atomic_fetch_and_explicit((device atomic_int*)&fin[row], 0, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ink_topk_sort2048(s_key, tid);
+    device ulong* o = out + ((size_t)row * INK_TOPK_SLICES + slice) * INK_TOPK_CAND;
+    for (uint i = tid; i < INK_TOPK_CAND; i += INK_TOPK_THREADS) o[i] = s_key[i];
+}
+
+// merge `m` sorted lists of 128 keys into one sorted list of 128 per group.
+// grid (groups, rows), 256 threads.
+kernel void ink_topk_merge(
+    device const ulong* in   [[buffer(0)]],
+    device ulong* out        [[buffer(1)]],
+    constant int& lists      [[buffer(2)]],
+    constant int& m          [[buffer(3)]],
+    constant int& groups     [[buffer(4)]],
+    uint2 tg2  [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    const uint g = tg2.x, row = tg2.y;
+    threadgroup ulong s_key[INK_TOPK_SORTN];
+    device const ulong* src = in + ((size_t)row * (uint)lists + (size_t)g * (uint)m) * INK_TOPK_CAND;
+    const uint n = (uint)m * INK_TOPK_CAND;
+    for (uint i = tid; i < INK_TOPK_SORTN; i += INK_TOPK_THREADS) s_key[i] = (i < n) ? src[i] : 0ul;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ink_topk_sort2048(s_key, tid);
+    device ulong* o = out + ((size_t)row * (uint)groups + g) * INK_TOPK_CAND;
+    for (uint i = tid; i < INK_TOPK_CAND; i += INK_TOPK_THREADS) o[i] = s_key[i];
+}
+
 // ============================================================================
 // 9. Exact Multi-Branch Tree Verification Kernels (0.00000 KLD, M <= 32 nodes!)
 //    - Non-destructive tree ShortConv (walks parent[m] 3 ancestor hops, saves raw x_in)
@@ -1315,7 +1467,7 @@ kernel void ink_kv_tree_commit_f16(
     const int i = int(tgp.x), kh = int(tgp.y);
     const int node = path_ids[i];
     const int pos = anchor_pos + i;
-    const int kpos = is_swa ? (pos & 1023) : pos;
+    const int kpos = is_swa ? (pos % kv_stride) : pos;
     const size_t src_off = ((size_t)node * INK_NKV + kh) * INK_HD + tid;
     const size_t dst_off = (((size_t)slot * kv_stride + kpos) * INK_NKV + kh) * INK_HD + tid;
     k_cache[dst_off] = tree_k[src_off];
@@ -1385,7 +1537,7 @@ kernel void ink_relpos_tree_gqa_splitk(
 
     const size_t slot_kv_base = (size_t)A.slot * A.kv_stride;
     for (int k = p_start + int(sg); k < p_end; k += 4) {
-        const int kidx = A.is_swa ? (k & 1023) : k;
+        const int kidx = A.is_swa ? (k % A.kv_stride) : k;
         const size_t kv_off = ((slot_kv_base + kidx) * INK_NKV + kh) * INK_HD;
         const float4 kv = float4(((device const half4*)(k_cache + kv_off))[lane]);
         const float4 vv = float4(((device const half4*)(v_cache + kv_off))[lane]);
