@@ -123,6 +123,9 @@ public:
     // A dependency graph in ONE concurrent encoder: a memory barrier only before dispatches with `barrier` set, so
     // the dispatches between two barriers may overlap.  Returns the GPU time in seconds.
     double run_graph(const std::vector<Dispatch>& ds, size_t count = (size_t) -1);   // count: only the first `count` dispatches (the step profile's prefixes)
+    // Same as run_graph but only dispatches [begin, end); a segment-open barrier is not needed
+    // (each range is its own command buffer).
+    double run_graph_range(const std::vector<Dispatch>& ds, size_t begin, size_t end);
     // run_graph on a SECOND queue, committed without waiting: the GPU may overlap it with work on the main queue (the two must touch
     // different buffers).  Returns a token; wait_async(token) blocks until it has completed (returns its GPU time in seconds).
     void* run_graph_async(const std::vector<Dispatch>& ds);

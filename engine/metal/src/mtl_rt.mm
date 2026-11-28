@@ -485,6 +485,33 @@ double Context::run_graph(const std::vector<Dispatch>& ds, size_t count) {
     }
 }
 
+double Context::run_graph_range(const std::vector<Dispatch>& ds, size_t begin, size_t end) {
+    static const bool spin = !(std::getenv("STRATA_METAL_SPIN") && std::string(std::getenv("STRATA_METAL_SPIN")) == "0");
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [impl_->q commandBufferWithUnretainedReferences];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        const size_t e = std::min(end, ds.size());
+        for (size_t i = begin; i < e; ++i) {
+            if (i > begin && ds[i].barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode(enc, ds[i]);
+        }
+        [enc endEncoding];
+        [cb commit];
+        impl_->touch();
+        if (spin) {
+            const auto t0 = std::chrono::steady_clock::now();
+            while (cb.status < MTLCommandBufferStatusCompleted &&
+                   std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 20e-3) {}
+        }
+        if (cb.status < MTLCommandBufferStatusCompleted) [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) {
+            std::fprintf(stderr, "mtl: command buffer failed: %s\n", [[cb.error localizedDescription] UTF8String]);
+            std::exit(5);
+        }
+        return cb.GPUEndTime - cb.GPUStartTime;
+    }
+}
+
 void* Context::run_graph_async(const std::vector<Dispatch>& ds) {
     @autoreleasepool {
         if (impl_->q2 == nil) impl_->q2 = [impl_->dev newCommandQueue];

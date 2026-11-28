@@ -151,7 +151,7 @@ struct InkMetalRunner {
     mtl::Pipeline p_sconv4_tree, p_sconv4_attn_res_tree, p_sconv4_mlp_add_tree, p_sconv4_tree_commit;
     mtl::Pipeline p_qr_clip_tau, p_kv_store_f16, p_kv_store_tree_f16, p_kv_tree_commit_f16;
     mtl::Pipeline p_relpos_gqa, p_relpos_gqa_splitk, p_relpos_gqa_splitk_red, p_relpos_tree_gqa_splitk;
-    mtl::Pipeline p_router_topk8, p_router_topk8_plan_m1, p_softcap, p_argmax_rows;
+    mtl::Pipeline p_router_topk8, p_router_topk8_plan_m1, p_softcap, p_argmax_rows, p_argmax_prob;
 
     mtl::Pipeline p_dsp_mix, p_dsp_ctx_kv, p_dsp_ctx_kv_tree, p_dsp_ctx_kv_tree_commit, p_dsp_init_bf16, p_dsp_init_q8;
     mtl::Pipeline p_dsp_qk_rope, p_dsp_attn, p_dsp_swiglu;
@@ -164,8 +164,11 @@ struct InkMetalRunner {
     bool use_dspark_meff = false;
 
     // Limits & capacities
-    int max_slots = 1;
-    int max_ctx = 8192;
+int max_slots = 1;
+int max_ctx = 8192;
+int pass_override = 0;            // 0 = model config; 1..num_passes forces loop count (LoopSpec/LoopCD experiments)
+float early_exit_tau = 0.0f;      // INK_EE env or set directly: if >0, decode M=1 can exit the loop core early
+long ee_fired = 0, ee_total = 0, ee_passes_run = 0;   // early-exit counters (run/pass granularity)
     int max_batch = 512;  // max tokens per forward_batch chunk
     int swa_ring = 1024;  // SWA KV ring stride (>= swa_win + max_batch, 64-aligned, capped at max_ctx)
     int swa_span_cap = 0; // max safe per-slot token span once pos >= swa_ring (0 = no cap)
@@ -222,7 +225,7 @@ struct InkMetalRunner {
     mtl::Buffer b_topk_trace;            // [48, MB, top_k] per-visit expert ids when INK_TRACE_EXPERTS is set
     mtl::Buffer b_moe_uexp, b_moe_uoff, b_moe_ucnt, b_moe_pairs, b_moe_meta, b_moe_tiles;
     mtl::Buffer b_moe_h, b_moe_yp, b_moe_raw, b_moe_out;
-    mtl::Buffer b_h_out, b_h_norm, b_h_gather, b_logits, b_argmax;
+    mtl::Buffer b_h_out, b_h_norm, b_h_gather, b_logits, b_argmax, b_argmax_p, b_ee_norm;
     mtl::Buffer b_taps4;                   // [4, max_batch, 2304] for DSpark taps [5, 23, 41, 48]
 
     // DSpark Block-8 scratch buffers (M=8)
@@ -376,6 +379,7 @@ struct InkMetalRunner {
         p_router_topk8_plan_m1 = cx->pipeline(lib_ops, "ink_router_topk8_plan_m1");
         p_softcap             = cx->pipeline(lib_ops, "ink_softcap_f32");
         p_argmax_rows         = cx->pipeline(lib_ops, "ink_argmax_rows");
+        p_argmax_prob         = cx->pipeline(lib_ops, "ink_argmax_prob");
         p_topk_pass1          = cx->pipeline(lib_ops, "ink_topk_pass1");
         p_topk_merge          = cx->pipeline(lib_ops, "ink_topk_merge");
 
@@ -602,6 +606,8 @@ struct InkMetalRunner {
         // Logits buffer: up to min(max_batch, 64) rows simultaneously (prefill uses last-token-only mode!)
         b_logits    = cx->alloc((size_t)std::min(max_batch, 64) * c.vocab_padded * 4);
         b_argmax    = cx->alloc(MB * 4);
+        b_argmax_p  = cx->alloc(MB * 4);
+        b_ee_norm   = cx->alloc(MB * D * 4);
         bd_part_val = cx->alloc(16ul * 16384ul * 4);
         bd_part_idx = cx->alloc(16ul * 16384ul * 4);
         b_taps4     = cx->alloc(4 * MB * D * 4);
@@ -1158,7 +1164,7 @@ struct InkMetalRunner {
     }
 
     // Execute ONE complete 48-visit Inkling-2-Mini forward pass for batch `step` in a SINGLE Metal command buffer!
-    bool forward_batch(const InkBatchStep& step, float* logits_out, int32_t* argmax_out, std::string& err) {
+    bool forward_batch(const InkBatchStep& step, float* logits_out, int32_t* argmax_out, std::string& err, float* prob_out = nullptr) {
         const int M = step.M;
         if (M <= 0 || M > max_batch) { err = "invalid batch M=" + std::to_string(M); return false; }
         const bool is_tree = step.is_tree;
@@ -2160,7 +2166,7 @@ struct InkMetalRunner {
         // INK_PASSES: experimental loop-count override (default 0 = use model config).
         // Fixed-3-pass-trained model: fewer passes is OOD; this is for measuring
         // the quality cost of pass reduction with/without LoopCD (arxiv 2610.02185).
-        static const int passes_override = [] {
+        const int passes_override = pass_override != 0 ? pass_override : [] {
             const char* e = std::getenv("INK_PASSES");
             return e ? std::atoi(e) : 0;
         }();
@@ -2172,6 +2178,24 @@ struct InkMetalRunner {
             return e ? std::atof(e) : 0.0f;
         }();
         const bool lcd_w_active = (lcd_w_cfg != 0.0f) && num_passes_eff >= 2;
+
+        // LoopSpec-style early exit (arXiv 2609.17184): on single-row decode forwards with
+        // logits requested, flush the command buffer at each pass boundary, unembed the
+        // pre-coda hidden state and read top-1 softmax prob; >= tau skips the remaining
+        // passes (fewer-loop-visit forward for that token). Pre-coda confidence gates the
+        // skip; the post-coda epilogue still produces the final argmax identically to a
+        // pass_override=p forward. Disabled for tree/cand/ring/dspark paths.
+        static const float ee_tau_env = [] {
+            const char* e = std::getenv("INK_EE");
+            return e ? std::atof(e) : 0.0f;
+        }();
+        const float ee_tau = early_exit_tau > 0.0f ? early_exit_tau : ee_tau_env;
+        const bool ee_ok = ee_tau > 0.0f && M == 1 && n_active_slots == 1 &&
+                           step.compute_logits && !is_tree && !step.is_tree &&
+                           !step.want_topk && !step.capture_taps && !step.record_verify_ring &&
+                           step.logits_rows.empty() && step.logits_last_only_idx < 0 &&
+                           num_passes_eff >= 2 && c.num_passes >= 3;
+        std::vector<int> ee_cuts;      // ds index ending each early pass (check already appended)
 
         // 2. Prelude: physical layers 0..5 (visits 0..5)
         int visit = 0;
@@ -2214,7 +2238,27 @@ struct InkMetalRunner {
                 // snapshot pure pass-0 hidden h_1 before pass 1 mutates b_cur
                 push_copy(mtl::Arg::B(b_cur), mtl::Arg::B(b_lcd_h1), M_stride);
             }
+            if (ee_ok && p_idx + 1 < num_passes_eff) {
+                // early-exit check: RMSNorm(b_cur, llm.norm) -> b_ee_norm, unembed row 0,
+                // deterministic argmax + top-1 softmax prob. Reads pre-coda hidden, same
+                // as --agree's probe point (coda is small and monotone on argmax).
+                mtl::Dispatch dn;
+                dn.p = &p_rms_norm; dn.grid[0] = 1; dn.tg[0] = 256;
+                dn.args = {mtl::Arg::B(b_cur), mod->tw("model.llm.norm.weight"),
+                           mtl::Arg::B(b_ee_norm), mtl::Arg::V(D)};
+                ds.push_back(std::move(dn));
+                push_trunk_linear(ds, "model.llm.unembed.weight", mtl::Arg::B(b_ee_norm),
+                                  mtl::Arg::B(b_logits), 1, c.vocab_unpadded);
+                mtl::Dispatch da;
+                da.p = &p_argmax_prob; da.grid[0] = 1; da.tg[0] = 256;
+                da.args = {mtl::Arg::B(b_logits), mtl::Arg::B(b_argmax), mtl::Arg::B(b_argmax_p),
+                           mtl::Arg::V(c.vocab_unpadded), mtl::Arg::V(c.logit_softcap)};
+                ds.push_back(std::move(da));
+                ee_cuts.push_back((int)ds.size());
+            }
         }
+
+        const size_t ee_epilogue_start = ds.size();
 
         // LoopCD-Hidden: h' = h_R + w*(h_R - h_1). h_R is b_cur at end of final pass;
         // h_1 is pure pass-0 output preserved in b_bank_out (bank_n == 0 during last pass when num_passes == 3
@@ -2328,8 +2372,9 @@ struct InkMetalRunner {
                     }
                     if (argmax_out) {
                         mtl::Dispatch d;
-                        d.p = &p_argmax_rows; d.grid[0] = 1; d.tg[0] = 256;
-                        d.args = {mtl::Arg::B(b_logits), mtl::Arg::B(b_argmax), mtl::Arg::V(c.vocab_unpadded)};
+                        d.p = &p_argmax_prob; d.grid[0] = 1; d.tg[0] = 256;
+                        d.args = {mtl::Arg::B(b_logits), mtl::Arg::B(b_argmax), mtl::Arg::B(b_argmax_p),
+                                  mtl::Arg::V(c.vocab_unpadded), mtl::Arg::V(c.logit_softcap)};
                         ds.push_back(std::move(d));
                     }
                 }
@@ -2462,8 +2507,9 @@ struct InkMetalRunner {
                     }
                     if (argmax_out) {
                         mtl::Dispatch d;
-                        d.p = &p_argmax_rows; d.grid[0] = (uint32_t)n_lg; d.tg[0] = 256;
-                        d.args = {mtl::Arg::B(b_logits), mtl::Arg::B(b_argmax), mtl::Arg::V(c.vocab_unpadded)};
+                        d.p = &p_argmax_prob; d.grid[0] = (uint32_t)n_lg; d.tg[0] = 256;
+                        d.args = {mtl::Arg::B(b_logits), mtl::Arg::B(b_argmax), mtl::Arg::B(b_argmax_p),
+                                  mtl::Arg::V(c.vocab_unpadded), mtl::Arg::V(c.logit_softcap)};
                         ds.push_back(std::move(d));
                     }
                 }
@@ -2581,6 +2627,31 @@ struct InkMetalRunner {
                         std::fprintf(stderr, "  %7.3f ms  %s\n", rows[i].first, rows[i].second.c_str());
                 }
             }
+        } else if (ee_ok) {
+            // Early-exit segmented run: [0, cut1) -> host read -> maybe [cut1, cut2) -> host read
+            // -> [last_cut, epi) -> [epi, end). Skipped segments are never encoded.
+            double gpu = 0.0;
+            ++ee_total;
+            int fired_at = -1;
+            gpu += cx->run_graph_range(ds, 0, (size_t)ee_cuts[0]);
+            ++ee_passes_run;
+            if (b_argmax_p.as<float>()[0] >= ee_tau) {
+                fired_at = 1;
+            } else {
+                for (size_t ci = 1; ci < ee_cuts.size(); ++ci) {
+                    gpu += cx->run_graph_range(ds, (size_t)ee_cuts[ci - 1], (size_t)ee_cuts[ci]);
+                    ++ee_passes_run;
+                    if (b_argmax_p.as<float>()[0] >= ee_tau) { fired_at = (int)ci + 1; break; }
+                }
+            }
+            if (fired_at < 0) {
+                gpu += cx->run_graph_range(ds, (size_t)ee_cuts.back(), ee_epilogue_start);
+                ++ee_passes_run;
+            } else {
+                ++ee_fired;
+            }
+            gpu += cx->run_graph_range(ds, ee_epilogue_start, ds.size());
+            last_gpu_ms = gpu * 1e3;
         } else {
             last_gpu_ms = cx->run_graph(ds) * 1e3;
         }
@@ -2673,6 +2744,9 @@ struct InkMetalRunner {
             }
             if (argmax_out) {
                 std::memcpy(argmax_out, b_argmax.ptr, (size_t)n_lg * sizeof(int32_t));
+            }
+            if (prob_out) {
+                std::memcpy(prob_out, b_argmax_p.ptr, (size_t)n_lg * sizeof(float));
             }
         }
         if (trace_experts && step.M >= 2 && step.M <= 8 && step.compute_logits) {

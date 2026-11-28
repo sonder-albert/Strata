@@ -1153,6 +1153,53 @@ kernel void ink_argmax_rows(
     if (tid == 0) out_ids[m] = sh_i[0];
 }
 
+// Deterministic first-max argmax + top-1 softmax probability (with softcap applied
+// inside the exponential, matching ink_softcap_f32 semantics). grid (M,1,1), 256 threads.
+kernel void ink_argmax_prob(
+    device const float* logits [[buffer(0)]],
+    device int* out_ids        [[buffer(1)]],
+    device float* out_prob     [[buffer(2)]],
+    constant int& V            [[buffer(3)]],
+    constant float& cap        [[buffer(4)]],
+    uint m   [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_v[256];
+    threadgroup int sh_i[256];
+    device const float* row = logits + (size_t)m * V;
+    float bv = -1e30f;
+    int bi = 0;
+    for (int i = int(tid); i < V; i += 256) {
+        const float v = row[i];
+        if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+    }
+    sh_v[tid] = bv; sh_i[tid] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            const float v1 = sh_v[tid + s];
+            const int i1 = sh_i[tid + s];
+            if (v1 > sh_v[tid] || (v1 == sh_v[tid] && i1 < sh_i[tid])) {
+                sh_v[tid] = v1; sh_i[tid] = i1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv = 1.0f / cap;
+    const float captop = cap * tanh(clamp(sh_v[0] * inv, -15.0f, 15.0f));
+    float ssum = 0.0f;
+    for (int i = int(tid); i < V; i += 256) {
+        const float z = cap * tanh(clamp(row[i] * inv, -15.0f, 15.0f));
+        ssum += exp(z - captop);
+    }
+    sh_v[tid] = ssum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sh_v[tid] += sh_v[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) { out_ids[m] = sh_i[0]; out_prob[m] = 1.0f / sh_v[0]; }
+}
+
 // ============================================================================
 // 9. Exact top-128 candidate extraction (port of CUDA ink_topk.cuh, #6779).
 //    key = (order-preserving 32-bit image of the logit) << 32 | (0xFFFFFFFF - id);

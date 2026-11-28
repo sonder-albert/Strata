@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <numeric>
 #include <random>
 #include <sstream>
@@ -390,6 +391,11 @@ static bool run_parallel_bench(InkMetalRunner& r, int c_req, int prompt_len, int
 
     // 2. Coalesced c_req-slot decode steps (all c_req slots in ONE 48-visit Metal command buffer per step!)
     double td0 = mtl::now_s();
+    // INK_PAR_RANDOM=1: per-slot decorrelated token streams (xorshift on the real next_toks would
+    // also decorrelate after step 1, but prompts above make every slot's early decode identical -
+    // identical hidden states route to identical experts, which understates MoE scatter traffic
+    // for real multi-tenant workloads). A fixed random schedule models independent requests.
+    static const bool par_random = std::getenv("INK_PAR_RANDOM") != nullptr;
     for (int step = 0; step < gen_steps; ++step) {
         InkBatchStep st;
         st.M = c_req;
@@ -399,6 +405,11 @@ static bool run_parallel_bench(InkMetalRunner& r, int c_req, int prompt_len, int
         for (int s = 0; s < c_req; ++s) {
             st.slot_ids[s] = s;
             st.pos[s] = prompt_len + step;
+            if (par_random) {
+                uint32_t h = (uint32_t)(s * 2654435761u + step * 40503u + 1u);
+                h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+                st.tok_ids[s] = 100 + (int)(h % 199000u);
+            }
         }
         st.compute_logits = true;
         if (!r.forward_batch(st, nullptr, next_toks.data(), err)) return false;
@@ -427,6 +438,8 @@ int main(int argc, char** argv) {
     bool do_bench = false;
     bool do_par_sweep = false;
     bool do_warm = true;
+    int agree_n = 0;
+    float ee_tau = 0.0f;
     std::vector<int32_t> custom_ids;
 
     for (int i = 1; i < argc; ++i) {
@@ -455,6 +468,8 @@ int main(int argc, char** argv) {
         else if (a == "--spec-check") do_spec_check = true;
         else if (a == "--bench") do_bench = true;
         else if (a == "--par-sweep") { do_par_sweep = true; if (max_slots < 64) max_slots = 64; }
+        else if (a == "--agree") agree_n = atoi(nxt().c_str());
+        else if (a == "--ee") ee_tau = (float)atof(nxt().c_str());
         else if (a == "--no-warm") do_warm = false;
         else if (a == "--dump-logits") dump_logits_path = nxt();
         else if (a == "--ids") {
@@ -611,6 +626,125 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+    }
+
+    if (agree_n > 0) {
+        // LoopSpec (arXiv 2609.17184) feasibility: how well do EARLY loop-pass argmaxes
+        // predict the final pass-3 token stream? Teacher-forced replay: feed the
+        // prompt + reference stream, take per-row argmax at pass=1,2,3, compare.
+        // Pass-3 agreement doubles as a batched-M-vs-M1 numeric divergence probe
+        // (the host-verify corruption suspect).
+        std::vector<int32_t> ref_ids;
+        double pm = 0, dm = 0; int acc = 0, off = 0;
+        runner.pass_override = 0;
+        if (!run_greedy_decode(runner, 0, custom_ids, agree_n, false, ref_ids, pm, dm, acc, off, err, 0)) {
+            fprintf(stderr, "[ERROR] agree ref decode: %s\n", err.c_str());
+            return 1;
+        }
+        // stream = prompt + reference continuation
+        std::vector<int32_t> stream = custom_ids;
+        stream.insert(stream.end(), ref_ids.begin(), ref_ids.end());
+        const int P = (int)custom_ids.size();
+        const int S = (int)stream.size();
+        // INK_AGREE_DUMP=<dir>: raw int32 dumps (stream.bin, argmax_p{1..3}.bin) for offline analysis
+        if (const char* dd = std::getenv("INK_AGREE_DUMP")) {
+            std::string fp = std::string(dd) + "/stream.bin";
+            FILE* f = std::fopen(fp.c_str(), "wb");
+            if (f) { std::fwrite(stream.data(), sizeof(int32_t), stream.size(), f); std::fclose(f); }
+        }
+
+        std::map<int, std::vector<int32_t>> am;   // passes -> argmax[row]
+        std::map<int, std::vector<float>>  pb;    // passes -> top-1 softmax prob[row]
+        double tf_ms[4] = {0, 0, 0, 0};
+        for (int p = 1; p <= mod.man.c.num_passes; ++p) {
+            runner.pass_override = p;
+            runner.reset_slot(0);
+            std::vector<int32_t> ar(S);
+            std::vector<float> pr(S);
+            double t0 = mtl::now_s();
+            for (int base = 0; base < S; base += 64) {
+                const int m = std::min(64, S - base);
+                InkBatchStep st;
+                st.M = m;
+                st.slot_ids.assign(m, 0);
+                st.pos.resize(m);
+                st.tok_ids.resize(m);
+                st.logits_rows.resize(m);
+                for (int i = 0; i < m; ++i) {
+                    st.pos[i] = base + i;
+                    st.tok_ids[i] = stream[base + i];
+                    st.logits_rows[i] = i;
+                }
+                st.compute_logits = true;
+                if (!runner.forward_batch(st, nullptr, ar.data() + base, err, pr.data() + base)) {
+                    fprintf(stderr, "[ERROR] agree forward p=%d: %s\n", p, err.c_str());
+                    return 1;
+                }
+            }
+            tf_ms[p] = (mtl::now_s() - t0) * 1e3;
+            am[p] = std::move(ar);
+            pb[p] = std::move(pr);
+            if (const char* dd = std::getenv("INK_AGREE_DUMP")) {
+                std::string fp = std::string(dd) + "/argmax_p" + std::to_string(p) + ".bin";
+                FILE* f = std::fopen(fp.c_str(), "wb");
+                if (f) { std::fwrite(am[p].data(), sizeof(int32_t), am[p].size(), f); std::fclose(f); }
+                fp = std::string(dd) + "/prob_p" + std::to_string(p) + ".bin";
+                f = std::fopen(fp.c_str(), "wb");
+                if (f) { std::fwrite(pb[p].data(), sizeof(float), pb[p].size(), f); std::fclose(f); }
+            }
+        }
+        // Metrics over generated rows: argmax at stream row i predicts stream[i+1].
+        printf("[AGREE] prompt=%d gen=%d ref_decode=%.1f ms | tf_fwd_ms p1=%.0f p2=%.0f p3=%.0f\n",
+               P, agree_n, dm, tf_ms[1], tf_ms[2], tf_ms[3]);
+        int hist[4][16] = {};
+        for (int p = 1; p <= mod.man.c.num_passes; ++p) {
+            int hit_stream = 0, hit_p3 = 0, n = 0;
+            for (int i = P - 1; i < S - 1; ++i) {
+                const int32_t gold = stream[i + 1];
+                int pos_in_win = i - (P - 1);
+                if (pos_in_win < 16) hist[p][pos_in_win] += (am[p][i] == gold) ? 1 : 0;
+                ++n;
+                if (am[p][i] == gold) ++hit_stream;
+                if (am[p][i] == am[3][i]) ++hit_p3;
+            }
+            // accepted-run length: longest prefix of consecutive stream hits from row P-1
+            int run = 0;
+            for (int i = P - 1; i < S - 1 && am[p][i] == stream[i + 1]; ++i) ++run;
+            printf("  pass=%d vs-ref %.3f  vs-pass3 %.3f  (n=%d) first_run=%d\n",
+                   p, (double)hit_stream / n, (double)hit_p3 / n, n, run);
+        }
+        // pass-3 batched argmax should equal greedy-decoded ref tokens ~1.000;
+        // a gap here reproduces host-verify-style divergence.
+    }
+
+    if (ee_tau > 0.0f) {
+        // Early-exit fidelity + speed check: greedy reference (tau=0) vs the same
+        // stream decoded with early exits at top-1-prob >= tau.
+        std::vector<int32_t> ref_ids, ee_ids;
+        double pm0 = 0, dm0 = 0, pm1 = 0, dm1 = 0;
+        int acc = 0, off = 0;
+        runner.early_exit_tau = 0.0f;
+        if (!run_greedy_decode(runner, 0, custom_ids, gen_n, false, ref_ids, pm0, dm0, acc, off, err, 0)) {
+            fprintf(stderr, "[ERROR] ee ref decode: %s\n", err.c_str());
+            return 1;
+        }
+        runner.early_exit_tau = ee_tau;
+        const long f0 = runner.ee_fired, t0n = runner.ee_total, p0 = runner.ee_passes_run;
+        if (!run_greedy_decode(runner, 0, custom_ids, gen_n, false, ee_ids, pm1, dm1, acc, off, err, 0)) {
+            fprintf(stderr, "[ERROR] ee decode: %s\n", err.c_str());
+            return 1;
+        }
+        int match = 0;
+        const int ncmp = (int)std::min(ref_ids.size(), ee_ids.size());
+        for (int i = 0; i < ncmp; ++i) { if (ref_ids[i] == ee_ids[i]) ++match; else break; }
+        const long ef = runner.ee_fired - f0, et = runner.ee_total - t0n, ep = runner.ee_passes_run - p0;
+        printf("[EE tau=%.2f] parity=%d/%d (%s) | ref=%.1f tok/s ee=%.1f tok/s | exits=%ld/%ld (%.1f%%) passes=%ld/%ld\n",
+               ee_tau, match, ncmp, (match == ncmp && ref_ids.size() == ee_ids.size()) ? "EXACT" : "DIFF",
+               ref_ids.size() / std::max(dm0 * 1e-3, 1e-6),
+               ee_ids.size() / std::max(dm1 * 1e-3, 1e-6),
+               ef, et, 100.0 * ef / std::max<long>(et, 1), ep, et * 3);
+        if (match != ncmp) printf("  first diff @%d: ref=%d ee=%d\n", match, ref_ids[match], ee_ids[match]);
+        runner.early_exit_tau = 0.0f;
     }
 
     return 0;
