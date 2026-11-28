@@ -1930,3 +1930,24 @@ INK_PASSES engine override retained for future experiments (accepted upstream va
 - adapt 模式(tree)运行中,输出与 no-spec 逐字节一致,31-35 tok/s
 - STRATA_INK_VDEBUG/NO_AMAX/NO_FUSED_TOPK 调试开关保留在代码中,env 默认关闭
 - Kaggle engram 训练 kernel 仍排队(账号 GPU 会话上限),v3 payload(fp16 tensor core+liger fused CE)就绪
+
+## 2026-11-28 M1 Max 接管:基线与判定
+
+### M1 Max (Apple7, 32GB, 无生产负载) 首批数字
+- no-spec ~31 tok/s;dspark tree ~42 tok/s(acc 97/117);spec-check BITWISE-EXACT 64/64
+- M6 优化快照(patches/)已移植到分支树并提交 inkling-metal-opt
+- 并行 decode step:M1 31ms / M4 80ms / M8 113ms(边际 ~15ms/行 vs M6 的 ~8ms;c=32 327ms agg 97.8)
+- GPU 时间占大头(TPROF build 0.3-0.5ms,rgwall = 全部)→ 不是编码成本,是 kernel 路径
+- **KV/SC 分配病灶确诊**:slots×max_ctx 全量预分配,64 slots 需 ~21GiB → cmd-buffer OOM。已修:budget clamp(slots→51,STRATA_INK_KV_MB/STRATA_INK_SLOTS 可调)
+- **跨 pass expert 缓存证伪**:修正 trace stride bug(原代码读错 buffer 报 8.00/8)→ 实测 p01=0.66 p02=0.55 p12=0.61 /8,≈随机。pass 间路由不相关,expert 每 visit 真流 ~8 个
+- is_apple10 门控在 M1 Max 全走非 tensor-core 路;MPP 门槛 M≥16,sk6_mm8 关闭,t_ver 用 M4 常量(待标定)
+
+### 杠杆排序(M1 Max 视角)
+1. megakernel 层内融合:M=1 空泡 ~45%(1412 dispatch/838 barrier),理论 ~12ms/token;参考 mirage MPK ~1.12x、llama-megakernel 教训是层内融合而非整模型
+2. verify 数值一致性:tree 路径 GPU verify 精确;block host verify 病态(疑 M>1 数值偏差放大,i=0 即拒)。修好后 fused topk/amax 兑现
+3. CB:trunk 单读已摊销,边际=MoE scatter;真正要做的是 KV paged/ring + server 侧调度
+4. KV2B 2-bit KV:同族模型外部证据,-75% KV 流量
+5. nvfp4 可选格式 PR:权重流减半,Apple7 走 simdgroup dequant,需 PTQ 质量门
+6. LoopCD:已集成(INK_LCD_W),fixed-3-pass 下中性保持关闭;后续跟社区 logits-adaptive+fused dual-unembed
+7. DSA:Inkling 已有 IndexShare top-2048 indexer → 本质是 qsa kernel 优化,4K ctx 下收益小
+8. GLM-5.4 借鉴:gated progressive updates≈attention residual 已有;MLA/CED/MoR 需重训,远期
